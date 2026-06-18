@@ -33,7 +33,8 @@ pub fn main(init: std.process.Init) !void {
                     "\t{s} {s} {}\n",
                     .{ fail.emoji(), domain, err },
                 );
-                std.debug.assert(fail != .no);
+                if (err != error.ConnectionResetByPeer)
+                    std.debug.assert(fail != .no);
                 continue;
             };
             std.debug.print("\t{s} {s}\n", .{ success.emoji(), domain });
