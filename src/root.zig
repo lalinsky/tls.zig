@@ -57,7 +57,7 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, opt: config.Server) !Connec
         .cipher = cipher,
         .input = input,
         .output = output,
-        .alpn_protocol = findAlpnProtocol(opt.alpn_protocols, hs.alpn_protocol),
+        .alpn_protocol = hs.alpn_protocol,
     };
 }
 
