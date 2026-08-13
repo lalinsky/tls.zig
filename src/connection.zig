@@ -32,17 +32,30 @@ pub const Connection = struct {
     const Self = @This();
 
     pub const State = enum {
+        /// Usable in both directions.
         open,
+        /// We sent close_notify; the peer may still be sending.
         close_sent,
+        /// Peer sent close_notify; we may still send.
         peer_closed,
+        /// Both sides sent close_notify.
         closed,
+        /// Reading hit a protocol error; `close` will send the alert.
         fatal_alert_pending,
+        /// Terminal. Nothing further is sent or received.
+        ///
+        /// A peer that closes its write side without close_notify lands
+        /// here too, which forecloses answering it over a TCP half-close.
+        /// That is deliberate: TLS has no half-close, and RFC 8446 6.1
+        /// requires close_notify before closing the write side, so such a
+        /// peer is non-conformant and there is nothing useful to say back.
         failed,
     };
 
     pub const ReadError = error{
         ReadFailed,
         InputBufferUndersize,
+        TlsUnexpectedEof,
         TlsTruncated,
         TlsRecordOverflow,
         TlsBadVersion,
@@ -74,6 +87,7 @@ pub const Connection = struct {
             error.ReadFailed,
             error.InputBufferUndersize,
             error.TlsCipherNoSpaceLeft,
+            error.TlsUnexpectedEof,
             error.TlsTruncated,
             error.EndOfStream,
             error.TlsConnectionFailed,
@@ -184,9 +198,16 @@ pub const Connection = struct {
         }
         while (true) {
             const rec = Record.read(c.input) catch |err| switch (err) {
+                // The peer closed the transport without sending close_notify.
+                // Whether that lost any data is for the caller to judge, so
+                // report which of the two it was: the stream ended between
+                // records, or in the middle of one.
                 error.EndOfStream => {
                     c.state = .failed;
-                    return error.TlsTruncated;
+                    return if (c.input.bufferedLen() == 0)
+                        error.TlsUnexpectedEof
+                    else
+                        error.TlsTruncated;
                 },
                 else => return err,
             };
@@ -244,11 +265,12 @@ pub const Connection = struct {
                         c.state = if (c.state == .close_sent) .closed else .peer_closed;
                         return error.EndOfStream;
                     }
-                    alert.toError() catch |err| {
-                        c.state = .failed;
-                        return err;
-                    };
-                    unreachable;
+                    c.state = .failed;
+                    // toError only succeeds for close_notify and
+                    // user_canceled, both handled above. Don't rely on that
+                    // holding for peer controlled input.
+                    alert.toError() catch |err| return err;
+                    return error.TlsUnexpectedMessage;
                 },
                 else => return error.TlsUnexpectedMessage,
             }
@@ -780,35 +802,63 @@ test "reader records ReadFailed for a lower-layer failure" {
     try testing.expectEqual(.open, conn.state);
 }
 
-test "transport EOF without close_notify is truncated" {
-    const EndingReader = struct {
-        interface: Io.Reader,
+/// Yields `prefix` and then ends the stream.
+const PartialReader = struct {
+    interface: Io.Reader,
+    prefix: []const u8,
 
-        fn init(buffer: []u8) @This() {
-            return .{
-                .interface = .{
-                    .vtable = &.{ .stream = stream },
-                    .buffer = buffer,
-                    .seek = 0,
-                    .end = 0,
-                },
-            };
-        }
+    fn init(buffer: []u8, prefix: []const u8) @This() {
+        return .{
+            .interface = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .prefix = prefix,
+        };
+    }
 
-        fn stream(_: *Io.Reader, _: *Io.Writer, _: Io.Limit) Io.Reader.StreamError!usize {
-            return error.EndOfStream;
-        }
-    };
+    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const self: *@This() = @fieldParentPtr("interface", r);
+        if (self.prefix.len == 0) return error.EndOfStream;
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        const n = @min(dest.len, self.prefix.len);
+        @memcpy(dest[0..n], self.prefix[0..n]);
+        w.advance(n);
+        self.prefix = self.prefix[n..];
+        return n;
+    }
+};
 
+test "transport EOF between records is an unexpected eof" {
     const client_cipher, _ = cipher.testCiphers();
     var input_buf: [record.header_len]u8 = undefined;
-    var input = EndingReader.init(&input_buf);
+    var input = PartialReader.init(&input_buf, "");
     var conn: Connection = .{
         .input = &input.interface,
         .output = undefined,
         .cipher = client_cipher,
     };
 
+    // Nothing was lost, the peer just skipped close_notify.
+    try testing.expectError(error.TlsUnexpectedEof, conn.next());
+    try testing.expectEqual(.failed, conn.state);
+    try testing.expectEqual(@as(?proto.Alert, null), conn.pending_alert);
+}
+
+test "transport EOF inside a record is a truncation" {
+    const client_cipher, _ = cipher.testCiphers();
+    var input_buf: [record.header_len]u8 = undefined;
+    // Three bytes of a five byte record header, then end of stream.
+    var input = PartialReader.init(&input_buf, &.{ @intFromEnum(proto.ContentType.application_data), 0x03, 0x03 });
+    var conn: Connection = .{
+        .input = &input.interface,
+        .output = undefined,
+        .cipher = client_cipher,
+    };
+
+    // A record was cut in half, so data was lost.
     try testing.expectError(error.TlsTruncated, conn.next());
     try testing.expectEqual(.failed, conn.state);
     try testing.expectEqual(@as(?proto.Alert, null), conn.pending_alert);

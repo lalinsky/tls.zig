@@ -28,7 +28,10 @@ pub const Record = struct {
     }
 
     const Error = error{
-        EndOfStream, // clean close of the stream
+        // Input ran out. On a stream this means the peer closed without
+        // close_notify, which `Connection.nextRecord` reports as
+        // TlsUnexpectedEof or TlsTruncated rather than a clean end.
+        EndOfStream,
         ReadFailed, // all other stream close
         InputBufferUndersize, // input can't fit tls record
         TlsRecordOverflow, // incorrect tls record
