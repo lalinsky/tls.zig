@@ -213,9 +213,7 @@ pub const Connection = struct {
                     else
                         error.TlsTruncated;
                 },
-                // The generic error from the reader below carries nothing;
-                // say so, and leave the real cause on that reader.
-                error.ReadFailed => return error.TransportReadFailed,
+                error.TransportReadFailed => return error.TransportReadFailed,
                 error.InputBufferUndersize => return error.InputBufferUndersize,
                 error.TlsRecordOverflow => return error.TlsRecordOverflow,
             };

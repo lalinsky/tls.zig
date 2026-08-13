@@ -105,9 +105,9 @@ pub const Handshake = struct {
             h.output.advance(ciphertext.len);
         } else {
             const alert = record.header(.alert, 2) ++ cleartext;
-            try h.output.writeAll(&alert);
+            h.output.writeAll(&alert) catch return error.TransportWriteFailed;
         }
-        try h.output.flush();
+        try h.flushOutput();
     }
 
     pub fn handshake(h: *Self, opt: Options) !Cipher {
@@ -123,7 +123,7 @@ pub const Handshake = struct {
             try h.writeAlert(null, err);
             return err;
         };
-        try h.output.flush();
+        try h.flushOutput();
 
         h.clientFlight2(opt) catch |err| {
             // writeAlert stays quiet when the client is the one that failed.
@@ -131,6 +131,12 @@ pub const Handshake = struct {
             return err;
         };
         return h.cipher;
+    }
+
+    /// Flushing is the only place the handshake touches the transport, so it
+    /// is the only place the writer's generic error has to be named.
+    fn flushOutput(h: *Self) error{TransportWriteFailed}!void {
+        h.output.flush() catch return error.TransportWriteFailed;
     }
 
     fn initKeys(h: *Self, opt: Options) void {

@@ -32,17 +32,30 @@ pub const Record = struct {
         // close_notify, which `Connection.nextRecord` reports as
         // TlsUnexpectedEof or TlsTruncated rather than a clean end.
         EndOfStream,
-        ReadFailed, // all other stream close
+        /// The reader underneath us failed. All we were told is that it did;
+        /// the error saying what actually went wrong is recorded on that
+        /// reader, which is where the caller should look.
+        TransportReadFailed,
         InputBufferUndersize, // input can't fit tls record
         TlsRecordOverflow, // incorrect tls record
     };
+
+    /// This is the one place the record layer touches the reader, so it is
+    /// also the one place the reader's generic error has to be named.
+    fn transportRead(rdr: *Io.Reader, n: usize, comptime consume: bool) Error![]u8 {
+        const f = if (consume) Io.Reader.take else Io.Reader.peek;
+        return f(rdr, n) catch |err| switch (err) {
+            error.EndOfStream => error.EndOfStream,
+            error.ReadFailed => error.TransportReadFailed,
+        };
+    }
 
     pub fn read(rdr: *Io.Reader) Error!Record {
         if (header_len > rdr.buffer.len) {
             @branchHint(.cold);
             return error.InputBufferUndersize;
         }
-        const hdr = try rdr.peek(header_len);
+        const hdr = try transportRead(rdr, header_len, false);
         const payload_len = mem.readInt(u16, hdr[3..5], .big);
         if (payload_len > max_ciphertext_len) {
             @branchHint(.cold);
@@ -53,7 +66,7 @@ pub const Record = struct {
             @branchHint(.cold);
             return error.InputBufferUndersize;
         }
-        return .init(try rdr.take(record_len));
+        return .init(try transportRead(rdr, record_len, true));
     }
 
     pub fn decoder(rdr: *Io.Reader) !Decoder {

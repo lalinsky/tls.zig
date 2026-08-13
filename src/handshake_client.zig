@@ -245,6 +245,12 @@ pub const Handshake = struct {
 
     const Self = @This();
 
+    /// Flushing is the only place the handshake touches the transport, so it
+    /// is the only place the writer's generic error has to be named.
+    fn flushOutput(h: *Self) error{TransportWriteFailed}!void {
+        h.output.flush() catch return error.TransportWriteFailed;
+    }
+
     fn initKeys(h: *Self, opt: Options) !void {
         const init_keys_buf_len = 32 + 46 + DhKeyPair.seed_len;
         var buf: [init_keys_buf_len]u8 = undefined;
@@ -326,7 +332,7 @@ pub const Handshake = struct {
 
         try h.makeClientHello(opt, resumption_ticket); // client flight 1
         h.max_client_record_len = h.output.end;
-        try h.output.flush();
+        try h.flushOutput();
 
         try h.readServerFlight1(); // server flight 1
 
@@ -347,7 +353,7 @@ pub const Handshake = struct {
             const app_cipher = try h.generateApplicationCipher(opt.key_log_callback);
             try h.makeClientFlight2Tls13(opt.auth, opt.rng); // client flight 2
             h.max_client_record_len = @max(h.max_client_record_len, h.output.end);
-            try h.output.flush();
+            try h.flushOutput();
 
             const secret_idx: ?usize = if (opt.session_resumption) |r|
                 try r.appendSecret(h.transcript.tag, h.transcript.resumptionSecret())
@@ -361,7 +367,7 @@ pub const Handshake = struct {
         try h.generateCipher(opt.key_log_callback, opt.rng);
         try h.makeClientFlight2Tls12(opt.auth, opt.rng); // client flight 2
         h.max_client_record_len = @max(h.max_client_record_len, h.output.end);
-        try h.output.flush();
+        try h.flushOutput();
         try h.readServerFlight2(); // server flight 2
         return .{ h.cipher, null };
     }
