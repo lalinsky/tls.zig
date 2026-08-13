@@ -213,8 +213,6 @@ pub const Alert = enum(u8) {
         return switch (err) {
             // Transport or resource failures. Not protocol violations, and
             // in most cases there is no longer a connection to send on.
-            error.ReadFailed,
-            error.WriteFailed,
             error.TransportReadFailed,
             error.TransportWriteFailed,
             error.EndOfStream,
@@ -368,8 +366,8 @@ test "Alert.isFromPeer covers exactly the alerts we can receive" {
 
 test "Alert.forLocalError sends nothing for transport failures" {
     for ([_]anyerror{
-        error.ReadFailed,
-        error.WriteFailed,
+        error.TransportReadFailed,
+        error.TransportWriteFailed,
         error.EndOfStream,
         error.TlsUnexpectedEof,
         error.TlsTruncated,
