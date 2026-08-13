@@ -1,6 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
-const mem = std.mem;
 const Io = std.Io;
 const assert = std.debug.assert;
 
@@ -11,8 +9,6 @@ const cipher = @import("cipher.zig");
 const Cipher = cipher.Cipher;
 const SessionResumption = @import("handshake_client.zig").Options.SessionResumption;
 
-const log = std.log.scoped(.tls);
-
 pub const Connection = struct {
     /// Underlying network connection stream reader/writer pair.
     input: *Io.Reader, // source of the encrypted (ciphertext) data
@@ -21,7 +17,8 @@ pub const Connection = struct {
 
     max_encrypt_seq: u64 = std.math.maxInt(u64) - 1,
     key_update_requested: bool = false,
-    received_close_notify: bool = false,
+    state: State = .open,
+    pending_alert: ?proto.Alert = null,
     /// Part of the cleartext record returned from next but not yet read by client.
     cleartext_buf: []const u8 = &.{},
 
@@ -34,14 +31,95 @@ pub const Connection = struct {
 
     const Self = @This();
 
+    pub const State = enum {
+        open,
+        close_sent,
+        peer_closed,
+        closed,
+        fatal_alert_pending,
+        failed,
+    };
+
+    pub const ReadError = error{
+        ReadFailed,
+        InputBufferUndersize,
+        TlsTruncated,
+        TlsRecordOverflow,
+        TlsBadVersion,
+        TlsCipherNoSpaceLeft,
+        TlsBadRecordMac,
+        TlsDecodeError,
+        TlsUnexpectedMessage,
+        TlsIllegalParameter,
+        TlsConnectionFailed,
+    } || proto.Alert.Error;
+
+    pub const WriteError = error{
+        WriteFailed,
+        TlsCipherNoSpaceLeft,
+        TlsUnexpectedMessage,
+        TlsConnectionFailed,
+    };
+
+    const RecordError = ReadError || error{EndOfStream};
+
+    fn queueAlert(c: *Self, err: RecordError) void {
+        const alert: proto.Alert = switch (err) {
+            error.TlsBadVersion => .protocol_version,
+            error.TlsBadRecordMac => .bad_record_mac,
+            error.TlsRecordOverflow => .record_overflow,
+            error.TlsDecodeError => .decode_error,
+            error.TlsUnexpectedMessage => .unexpected_message,
+            error.TlsIllegalParameter => .illegal_parameter,
+            error.ReadFailed,
+            error.InputBufferUndersize,
+            error.TlsCipherNoSpaceLeft,
+            error.TlsTruncated,
+            error.EndOfStream,
+            error.TlsConnectionFailed,
+            error.TlsAlertUnexpectedMessage,
+            error.TlsAlertBadRecordMac,
+            error.TlsAlertRecordOverflow,
+            error.TlsAlertHandshakeFailure,
+            error.TlsAlertBadCertificate,
+            error.TlsAlertUnsupportedCertificate,
+            error.TlsAlertCertificateRevoked,
+            error.TlsAlertCertificateExpired,
+            error.TlsAlertCertificateUnknown,
+            error.TlsAlertIllegalParameter,
+            error.TlsAlertUnknownCa,
+            error.TlsAlertAccessDenied,
+            error.TlsAlertDecodeError,
+            error.TlsAlertDecryptError,
+            error.TlsAlertProtocolVersion,
+            error.TlsAlertInsufficientSecurity,
+            error.TlsAlertInternalError,
+            error.TlsAlertInappropriateFallback,
+            error.TlsAlertMissingExtension,
+            error.TlsAlertUnsupportedExtension,
+            error.TlsAlertUnrecognizedName,
+            error.TlsAlertBadCertificateStatusResponse,
+            error.TlsAlertUnknownPskIdentity,
+            error.TlsAlertCertificateRequired,
+            error.TlsAlertNoApplicationProtocol,
+            error.TlsAlertUnknown,
+            => return,
+        };
+        c.pending_alert = alert;
+        c.state = .fatal_alert_pending;
+    }
+
+    fn keyUpdateNeeded(c: *const Self) bool {
+        return c.cipher.encryptSeq() >= c.max_encrypt_seq or
+            @atomicLoad(bool, &c.key_update_requested, .monotonic);
+    }
+
     /// Encrypts and writes single tls record to the stream.
-    fn writeRecord(c: *Self, content_type: proto.ContentType, bytes: []const u8) !void {
+    fn writeRecord(c: *Self, content_type: proto.ContentType, bytes: []const u8) WriteError!void {
         assert(bytes.len <= cipher.max_cleartext_len);
         // If key update is requested send key update message and update
         // my encryption keys.
-        if (c.cipher.encryptSeq() >= c.max_encrypt_seq or @atomicLoad(bool, &c.key_update_requested, .monotonic)) {
-            @atomicStore(bool, &c.key_update_requested, false, .monotonic);
-
+        if (c.keyUpdateNeeded()) {
             // If the request_update field is set to "update_requested",
             // then the receiver MUST send a KeyUpdate of its own with
             // request_update set to "update_not_requested" prior to sending
@@ -53,41 +131,65 @@ pub const Connection = struct {
             // rfc: https://datatracker.ietf.org/doc/html/rfc8446#autoid-57
             const key_update = &record.handshakeHeader(.key_update, 1) ++ [_]u8{0};
             try c.encryptWrite(.handshake, key_update);
-            try c.cipher.keyUpdateEncrypt();
+            c.cipher.keyUpdateEncrypt() catch |err| {
+                c.state = .failed;
+                return err;
+            };
+            @atomicStore(bool, &c.key_update_requested, false, .monotonic);
         }
         try c.encryptWrite(content_type, bytes);
     }
 
-    fn encryptWrite(c: *Self, content_type: proto.ContentType, bytes: []const u8) !void {
+    fn encryptWrite(c: *Self, content_type: proto.ContentType, bytes: []const u8) WriteError!void {
         const encrypted_len = c.cipher.recordLen(bytes.len);
-        const writable = try c.output.writableSliceGreedy(encrypted_len);
-        const rec = try c.cipher.encrypt(writable, content_type, bytes);
+        const writable = c.output.writableSliceGreedy(encrypted_len) catch |err| {
+            c.state = .failed;
+            return err;
+        };
+        const rec = c.cipher.encrypt(writable, content_type, bytes) catch |err| {
+            c.state = .failed;
+            return err;
+        };
         c.output.advance(rec.len);
-        try c.output.flush();
+        c.output.flush() catch |err| {
+            c.state = .failed;
+            return err;
+        };
     }
 
     /// Returns next record of cleartext data. Null on end of stream.
     /// Can be used in iterator like loop without memcpy to another buffer:
     ///   while (try client.next()) |buf| { ... }
-    pub fn next(c: *Self) anyerror!?[]const u8 {
+    pub fn next(c: *Self) ReadError!?[]const u8 {
         return c.nextRecord(&.{}) catch |err| {
-            if (err == error.EndOfStream) return null;
-            // Write alert on tls errors.
-            // Stream errors return to the caller.
-            if (mem.startsWith(u8, @errorName(err), "Tls"))
-                try c.encryptWrite(.alert, &proto.alertFromError(err));
-            return err;
+            switch (err) {
+                error.EndOfStream => return null,
+                else => {
+                    c.queueAlert(err);
+                    return @errorCast(err);
+                },
+            }
         };
     }
 
     /// Decrypt next tls record into buffer, if buffer is not big enough reuse
     /// input ciphertext buffer for cleartext. Returns cleartext of the next tls
     /// record.
-    fn nextRecord(c: *Self, buffer: []u8) ![]const u8 {
+    fn nextRecord(c: *Self, buffer: []u8) RecordError![]const u8 {
         assert(c.cleartext_buf.len == 0);
-        if (c.received_close_notify) return error.EndOfStream;
+        switch (c.state) {
+            .open, .close_sent => {},
+            .peer_closed, .closed => return error.EndOfStream,
+            .fatal_alert_pending, .failed => return error.TlsConnectionFailed,
+        }
         while (true) {
-            const rec = try Record.read(c.input);
+            const rec = Record.read(c.input) catch |err| switch (err) {
+                error.EndOfStream => {
+                    c.state = .failed;
+                    return error.TlsTruncated;
+                },
+                else => return err,
+            };
             if (rec.protocol_version != .tls_1_2) return error.TlsBadVersion;
 
             // If provided buffer is not big enough reuse input buffer for
@@ -100,7 +202,7 @@ pub const Connection = struct {
             const content_type, const cleartext = c.cipher.decrypt(cleartext_buf, rec) catch |err| switch (err) {
                 // Do not expose distinguishable record deprotection failures.
                 error.TlsDecryptError, error.TlsBadRecordMac => return error.TlsBadRecordMac,
-                else => return err,
+                else => return @errorCast(err),
             };
 
             switch (content_type) {
@@ -136,10 +238,17 @@ pub const Connection = struct {
                 },
                 .alert => {
                     if (cleartext.len < 2) return error.TlsUnexpectedMessage;
-                    try proto.Alert.parse(cleartext[0..2].*).toError();
-                    // server side clean shutdown
-                    c.received_close_notify = true;
-                    return error.EndOfStream;
+                    const alert = proto.Alert.parse(cleartext[0..2].*);
+                    if (alert == .user_canceled) continue;
+                    if (alert == .close_notify) {
+                        c.state = if (c.state == .close_sent) .closed else .peer_closed;
+                        return error.EndOfStream;
+                    }
+                    alert.toError() catch |err| {
+                        c.state = .failed;
+                        return err;
+                    };
+                    unreachable;
                 },
                 else => return error.TlsUnexpectedMessage,
             }
@@ -148,12 +257,47 @@ pub const Connection = struct {
     }
 
     pub fn eof(c: *Self) bool {
-        return c.received_close_notify and c.cleartext_buf.len == 0;
+        return (c.state == .peer_closed or c.state == .closed) and c.cleartext_buf.len == 0;
     }
 
-    pub fn close(c: *Self) anyerror!void {
-        if (c.received_close_notify) return;
-        try c.writeRecord(.alert, &proto.Alert.closeNotify());
+    fn encodeClose(c: *Self, ciphertext: []u8) WriteError!?[]const u8 {
+        const cleartext, const next_state: State = switch (c.state) {
+            .open => .{ proto.Alert.closeNotify(), .close_sent },
+            .peer_closed => .{ proto.Alert.closeNotify(), .closed },
+            .fatal_alert_pending => .{ [2]u8{
+                @intFromEnum(proto.Alert.Level.fatal),
+                @intFromEnum(c.pending_alert.?),
+            }, .failed },
+            .close_sent, .closed, .failed => return null,
+        };
+
+        if (ciphertext.len < c.cipher.recordLen(cleartext.len))
+            return error.TlsCipherNoSpaceLeft;
+        const rec = c.cipher.encrypt(ciphertext, .alert, &cleartext) catch |err| {
+            c.pending_alert = null;
+            c.state = .failed;
+            return err;
+        };
+        c.pending_alert = null;
+        c.state = next_state;
+        return rec;
+    }
+
+    /// Closes the write side of the connection. Sends a queued fatal alert if
+    /// reading failed, otherwise sends close_notify. Repeated calls are no-ops.
+    pub fn close(c: *Self) WriteError!void {
+        if (c.state == .close_sent or c.state == .closed or c.state == .failed) return;
+        const writable = c.output.writableSliceGreedy(c.cipher.recordLen(2)) catch |err| {
+            c.pending_alert = null;
+            c.state = .failed;
+            return err;
+        };
+        const rec = (try c.encodeClose(writable)) orelse return;
+        c.output.advance(rec.len);
+        c.output.flush() catch |err| {
+            c.state = .failed;
+            return err;
+        };
     }
 
     // write/read
@@ -161,7 +305,8 @@ pub const Connection = struct {
     /// Encrypts cleartext and writes it to the underlying stream as single
     /// tls record. Max single tls record payload length is 1<<14 (16K)
     /// bytes.
-    pub fn write(c: *Self, bytes: []const u8) !usize {
+    pub fn write(c: *Self, bytes: []const u8) WriteError!usize {
+        if (c.state != .open) return error.TlsConnectionFailed;
         const encrypt_overhead = c.cipher.encryptOverhead();
         assert(c.output.buffer.len > encrypt_overhead);
         // Find maximum number of bytes which can fit into output buffer as encrypted ciphertext
@@ -172,20 +317,23 @@ pub const Connection = struct {
 
     /// Encrypts cleartext and writes it to the underlying stream. If needed
     /// splits cleartext into multiple tls record.
-    pub fn writeAll(c: *Self, bytes: []const u8) !void {
+    pub fn writeAll(c: *Self, bytes: []const u8) WriteError!void {
         var index: usize = 0;
         while (index < bytes.len) {
             index += try c.write(bytes[index..]);
         }
     }
 
-    pub fn read(c: *Self, buffer: []u8) !usize {
+    pub fn read(c: *Self, buffer: []u8) ReadError!usize {
         if (c.cleartext_buf.len == 0) {
             const cleartext = c.nextRecord(buffer) catch |err| {
-                if (err == error.EndOfStream) return 0;
-                if (mem.startsWith(u8, @errorName(err), "Tls"))
-                    try c.encryptWrite(.alert, &proto.alertFromError(err));
-                return err;
+                switch (err) {
+                    error.EndOfStream => return 0,
+                    else => {
+                        c.queueAlert(err);
+                        return @errorCast(err);
+                    },
+                }
             };
             if (cleartext.ptr == buffer.ptr) {
                 // provided buffer is used for cleartext
@@ -204,7 +352,7 @@ pub const Connection = struct {
 
     /// Returns the number of bytes read. If the number read is smaller than
     /// `buffer.len`, it means the stream reached the end.
-    pub fn readAll(c: *Self, buffer: []u8) !usize {
+    pub fn readAll(c: *Self, buffer: []u8) ReadError!usize {
         return c.readAtLeast(buffer, buffer.len);
     }
 
@@ -212,7 +360,7 @@ pub const Connection = struct {
     /// the minimal number of times until the buffer has at least `len` bytes
     /// filled. If the number read is less than `len` it means the stream
     /// reached the end.
-    pub fn readAtLeast(c: *Self, buffer: []u8, len: usize) !usize {
+    pub fn readAtLeast(c: *Self, buffer: []u8, len: usize) ReadError!usize {
         assert(len <= buffer.len);
         var index: usize = 0;
         while (index < len) {
@@ -225,7 +373,7 @@ pub const Connection = struct {
 
     /// Returns the number of bytes read. If the number read is less than
     /// the space provided it means the stream reached the end.
-    pub fn readv(c: *Self, iovecs: []std.posix.iovec) !usize {
+    pub fn readv(c: *Self, iovecs: []std.posix.iovec) ReadError!usize {
         var vp: VecPut = .{ .iovecs = iovecs };
         while (true) {
             if (c.cleartext_buf.len == 0) {
@@ -264,6 +412,7 @@ pub const Connection = struct {
 
         fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
             const self: *Reader = @fieldParentPtr("interface", r);
+            self.err = null;
             const buf = limit.slice(try w.writableSliceGreedy(1));
             const n = self.conn.read(buf) catch |err| {
                 self.err = err;
@@ -348,6 +497,7 @@ pub const Connection = struct {
         }
 
         fn writeAll(self: *Writer, bytes: []const u8) Io.Writer.Error!void {
+            self.err = null;
             self.conn.writeAll(bytes) catch |err| {
                 self.err = err;
                 return error.WriteFailed;
@@ -538,12 +688,197 @@ test "client/server connection" {
         server_conn.input = &r;
         var server_cleartext_buf: [cleartext_buf.len]u8 = undefined;
         // read cleartext from the server connection
-        const nr = try server_conn.readAll(&server_cleartext_buf);
+        const nr = try server_conn.readAll(server_cleartext_buf[0..n]);
         const server_cleartext = server_cleartext_buf[0..nr];
 
         try testing.expectEqual(n, nr);
         try testing.expectEqualSlices(u8, client_cleartext, server_cleartext);
     }
+}
+
+test "read queues protocol alert without writing" {
+    const client_cipher, var server_cipher = cipher.testCiphers();
+    // A complete record header with a version rejected by established TLS
+    // connections. The payload is empty, so no decryption is attempted.
+    const invalid_record = [_]u8{
+        @intFromEnum(proto.ContentType.application_data),
+        0x03,
+        0x04,
+        0,
+        0,
+    };
+    var input: Io.Reader = .fixed(&invalid_record);
+    var output_buf: [64]u8 = undefined;
+    var output: Io.Writer = .fixed(&output_buf);
+    var conn: Connection = .{
+        .input = &input,
+        .output = &output,
+        .cipher = client_cipher,
+    };
+    var cleartext: [1]u8 = undefined;
+
+    try testing.expectError(error.TlsBadVersion, conn.read(&cleartext));
+    try testing.expectEqual(.fatal_alert_pending, conn.state);
+    try testing.expectEqual(0, output.end);
+    try testing.expectError(error.TlsConnectionFailed, conn.write("data"));
+
+    try conn.close();
+    try testing.expectEqual(.failed, conn.state);
+    try testing.expect(output.end > 0);
+    const content_type, const alert = try server_cipher.decrypt(
+        &output_buf,
+        Record.init(output.buffered()),
+    );
+    try testing.expectEqual(.alert, content_type);
+    try testing.expectEqualSlices(u8, &.{
+        @intFromEnum(proto.Alert.Level.fatal),
+        @intFromEnum(proto.Alert.protocol_version),
+    }, alert);
+    const alert_end = output.end;
+    try conn.close();
+    try testing.expectEqual(alert_end, output.end);
+    try testing.expectError(error.TlsConnectionFailed, conn.read(&cleartext));
+}
+
+test "reader records ReadFailed for a lower-layer failure" {
+    const FailingReader = struct {
+        interface: Io.Reader,
+        err: ?error{Canceled} = null,
+
+        fn init(buffer: []u8) @This() {
+            return .{
+                .interface = .{
+                    .vtable = &.{ .stream = stream },
+                    .buffer = buffer,
+                    .seek = 0,
+                    .end = 0,
+                },
+            };
+        }
+
+        fn stream(r: *Io.Reader, _: *Io.Writer, _: Io.Limit) Io.Reader.StreamError!usize {
+            const self: *@This() = @fieldParentPtr("interface", r);
+            self.err = error.Canceled;
+            return error.ReadFailed;
+        }
+    };
+
+    const client_cipher, _ = cipher.testCiphers();
+    var transport_buf: [record.header_len]u8 = undefined;
+    var transport_reader = FailingReader.init(&transport_buf);
+    var conn: Connection = .{
+        .input = &transport_reader.interface,
+        .output = undefined,
+        .cipher = client_cipher,
+    };
+    var tls_buf: [1]u8 = undefined;
+    var tls_reader = conn.reader(&tls_buf);
+
+    try testing.expectError(error.ReadFailed, tls_reader.interface.take(1));
+    try testing.expectEqual(error.ReadFailed, tls_reader.err.?);
+    try testing.expectEqual(error.Canceled, transport_reader.err.?);
+    try testing.expectEqual(.open, conn.state);
+}
+
+test "transport EOF without close_notify is truncated" {
+    const EndingReader = struct {
+        interface: Io.Reader,
+
+        fn init(buffer: []u8) @This() {
+            return .{
+                .interface = .{
+                    .vtable = &.{ .stream = stream },
+                    .buffer = buffer,
+                    .seek = 0,
+                    .end = 0,
+                },
+            };
+        }
+
+        fn stream(_: *Io.Reader, _: *Io.Writer, _: Io.Limit) Io.Reader.StreamError!usize {
+            return error.EndOfStream;
+        }
+    };
+
+    const client_cipher, _ = cipher.testCiphers();
+    var input_buf: [record.header_len]u8 = undefined;
+    var input = EndingReader.init(&input_buf);
+    var conn: Connection = .{
+        .input = &input.interface,
+        .output = undefined,
+        .cipher = client_cipher,
+    };
+
+    try testing.expectError(error.TlsTruncated, conn.next());
+    try testing.expectEqual(.failed, conn.state);
+    try testing.expectEqual(@as(?proto.Alert, null), conn.pending_alert);
+}
+
+test "peer close_notify is answered by close" {
+    const client_cipher, var server_cipher = cipher.testCiphers();
+    var peer_buf: [64]u8 = undefined;
+    const peer_close = try server_cipher.encrypt(&peer_buf, .alert, &proto.Alert.closeNotify());
+    var input: Io.Reader = .fixed(peer_close);
+    var output_buf: [64]u8 = undefined;
+    var output: Io.Writer = .fixed(&output_buf);
+    var conn: Connection = .{
+        .input = &input,
+        .output = &output,
+        .cipher = client_cipher,
+    };
+    var cleartext: [1]u8 = undefined;
+
+    try testing.expectEqual(0, try conn.read(&cleartext));
+    try testing.expectEqual(.peer_closed, conn.state);
+    try testing.expectEqual(0, output.end);
+
+    try conn.close();
+    try testing.expectEqual(.closed, conn.state);
+    const content_type, const response = try server_cipher.decrypt(
+        &peer_buf,
+        Record.init(output.buffered()),
+    );
+    try testing.expectEqual(.alert, content_type);
+    try testing.expectEqualSlices(u8, &proto.Alert.closeNotify(), response);
+}
+
+test "failed fatal alert write is terminal and is not retried" {
+    const FailingWriter = struct {
+        interface: Io.Writer,
+
+        fn init(buffer: []u8) @This() {
+            return .{
+                .interface = .{
+                    .vtable = &.{ .drain = drain },
+                    .buffer = buffer,
+                    .end = 0,
+                },
+            };
+        }
+
+        fn drain(_: *Io.Writer, _: []const []const u8, _: usize) Io.Writer.Error!usize {
+            return error.WriteFailed;
+        }
+    };
+
+    const client_cipher, _ = cipher.testCiphers();
+    var output_buf: [64]u8 = undefined;
+    var output = FailingWriter.init(&output_buf);
+    var conn: Connection = .{
+        .input = undefined,
+        .output = &output.interface,
+        .cipher = client_cipher,
+        .state = .fatal_alert_pending,
+        .pending_alert = .decode_error,
+    };
+
+    try testing.expectError(error.WriteFailed, conn.close());
+    try testing.expectEqual(.failed, conn.state);
+    try testing.expectEqual(@as(?proto.Alert, null), conn.pending_alert);
+    const end = output.interface.end;
+    try conn.close();
+    try testing.expectEqual(end, output.interface.end);
+    try testing.expectError(error.TlsConnectionFailed, conn.write("data"));
 }
 
 pub const NonBlock = struct {
@@ -558,11 +893,25 @@ pub const NonBlock = struct {
     /// Required ciphertext buffer length for the given cleartext length.
     pub fn encryptedLength(self: Self, cleartext_len: usize) usize {
         const c = self.inner.cipher;
-        const records_count = cleartext_len / cipher.max_cleartext_len;
-        if (records_count == 0) return c.recordLen(cleartext_len);
-        const last_chunk_len = cleartext_len - cipher.max_cleartext_len * records_count;
-        return c.recordLen(cipher.max_cleartext_len) * records_count +
-            if (last_chunk_len == 0) 0 else c.recordLen(last_chunk_len);
+        if (cleartext_len == 0) return 0;
+
+        const key_update = &record.handshakeHeader(.key_update, 1) ++ [_]u8{0};
+        var total: usize = 0;
+        var pos: usize = 0;
+        var seq = c.encryptSeq();
+        var update_requested = @atomicLoad(bool, &self.inner.key_update_requested, .monotonic);
+        while (pos < cleartext_len) {
+            if (update_requested or seq >= self.inner.max_encrypt_seq) {
+                total += c.recordLen(key_update.len);
+                seq = 0;
+                update_requested = false;
+            }
+            const n = @min(cleartext_len - pos, cipher.max_cleartext_len);
+            total += c.recordLen(n);
+            seq +%= 1;
+            pos += n;
+        }
+        return total;
     }
 
     fn reset(self: *Self) void {
@@ -579,7 +928,7 @@ pub const NonBlock = struct {
         cleartext: []const u8,
         /// Write buffer for ciphertext; encrypted data
         ciphertext: []u8,
-    ) !struct {
+    ) Connection.WriteError!struct {
         /// Number of bytes consumed from cleartext
         cleartext_pos: usize = 0,
         /// Unused part of the provided cleartext buffer
@@ -587,18 +936,51 @@ pub const NonBlock = struct {
         /// Encrypted ciphertext data
         ciphertext: []u8,
     } {
-        defer self.reset();
-        var output: Io.Writer = .fixed(ciphertext);
-        self.inner.output = &output;
-
+        if (self.inner.state != .open) return error.TlsConnectionFailed;
+        const key_update = &record.handshakeHeader(.key_update, 1) ++ [_]u8{0};
         var n: usize = 0;
-        while (n < cleartext.len and output.end < output.buffer.len) {
-            n += try self.inner.write(cleartext[n..]);
+        var out_pos: usize = 0;
+        while (n < cleartext.len) {
+            if (self.inner.keyUpdateNeeded()) {
+                const update_len = self.inner.cipher.recordLen(key_update.len);
+                if (ciphertext.len - out_pos < update_len) {
+                    if (out_pos == 0) return error.TlsCipherNoSpaceLeft;
+                    break;
+                }
+                const rec = self.inner.cipher.encrypt(ciphertext[out_pos..], .handshake, key_update) catch |err| {
+                    self.inner.state = .failed;
+                    return err;
+                };
+                out_pos += rec.len;
+                self.inner.cipher.keyUpdateEncrypt() catch |err| {
+                    self.inner.state = .failed;
+                    return err;
+                };
+                @atomicStore(bool, &self.inner.key_update_requested, false, .monotonic);
+            }
+
+            const overhead = self.inner.cipher.encryptOverhead();
+            if (ciphertext.len - out_pos <= overhead) break;
+            const chunk_len = @min(
+                cleartext.len - n,
+                cipher.max_cleartext_len,
+                ciphertext.len - out_pos - overhead,
+            );
+            const rec = self.inner.cipher.encrypt(
+                ciphertext[out_pos..],
+                .application_data,
+                cleartext[n..][0..chunk_len],
+            ) catch |err| {
+                self.inner.state = .failed;
+                return err;
+            };
+            out_pos += rec.len;
+            n += chunk_len;
         }
         return .{
             .cleartext_pos = n,
             .unused_cleartext = cleartext[n..],
-            .ciphertext = output.buffered(),
+            .ciphertext = ciphertext[0..out_pos],
         };
     }
 
@@ -610,7 +992,7 @@ pub const NonBlock = struct {
         ciphertext: []const u8,
         /// Write buffer for cleartext; decrypted data
         cleartext: []u8,
-    ) !struct {
+    ) Connection.ReadError!struct {
         /// Number of bytes consumed from provided ciphertext buffer
         ciphertext_pos: usize,
         /// Unconsumed part of the provided ciphertext buffer
@@ -625,7 +1007,7 @@ pub const NonBlock = struct {
         self.inner.input = &input;
 
         var n: usize = 0;
-        while (n < cleartext.len) {
+        while (n < cleartext.len and input.buffered().len > 0) {
             const nn = self.inner.read(cleartext[n..]) catch |err| switch (err) {
                 error.InputBufferUndersize => break,
                 else => return err,
@@ -638,12 +1020,12 @@ pub const NonBlock = struct {
             .ciphertext_pos = input.seek,
             .unused_ciphertext = input.buffered(),
             .cleartext = cleartext[0..n],
-            .closed = self.inner.received_close_notify,
+            .closed = self.inner.state == .peer_closed or self.inner.state == .closed,
         };
     }
 
-    pub fn close(self: *Self, ciphertext: []u8) ![]const u8 {
-        return try self.inner.cipher.encrypt(ciphertext, .alert, &proto.Alert.closeNotify());
+    pub fn close(self: *Self, ciphertext: []u8) Connection.WriteError![]const u8 {
+        return (try self.inner.encodeClose(ciphertext)) orelse &.{};
     }
 };
 
@@ -690,4 +1072,66 @@ test "nonblock decrypt" {
 
     const res = try conn.decrypt(&ciphertext, &cleartext_buf);
     try testing.expectEqualSlices(u8, "ping", res.cleartext);
+}
+
+test "nonblock key update is included in encryptedLength" {
+    const Transcript = @import("transcript.zig").Transcript;
+    const CipherSuite = cipher.CipherSuite;
+    const client_secret = [_]u8{1} ** 48;
+    const server_secret = [_]u8{2} ** 48;
+    const secret: Transcript.Secret = .{
+        .client = &client_secret,
+        .server = &server_secret,
+    };
+    const client_cipher = try Cipher.initTls13(CipherSuite.AES_256_GCM_SHA384, secret, .client);
+    const server_cipher = try Cipher.initTls13(CipherSuite.AES_256_GCM_SHA384, secret, .server);
+    var client = NonBlock.init(client_cipher);
+    var server = NonBlock.init(server_cipher);
+    @atomicStore(bool, &client.inner.key_update_requested, true, .monotonic);
+
+    const cleartext = "ping";
+    const encrypted_len = client.encryptedLength(cleartext.len);
+    try testing.expect(encrypted_len > client.inner.cipher.recordLen(cleartext.len));
+    var ciphertext_buf: [128]u8 = undefined;
+    const encrypted = try client.encrypt(cleartext, ciphertext_buf[0..encrypted_len]);
+    try testing.expectEqual(cleartext.len, encrypted.cleartext_pos);
+    try testing.expectEqual(encrypted_len, encrypted.ciphertext.len);
+
+    var cleartext_buf: [32]u8 = undefined;
+    const decrypted = try server.decrypt(encrypted.ciphertext, &cleartext_buf);
+    try testing.expectEqualSlices(u8, cleartext, decrypted.cleartext);
+    try testing.expectEqual(encrypted_len, decrypted.ciphertext_pos);
+}
+
+test "nonblock close uses pending fatal alert and state" {
+    const client_cipher, _ = cipher.testCiphers();
+    var conn = NonBlock.init(client_cipher);
+    const invalid_record = [_]u8{
+        @intFromEnum(proto.ContentType.application_data),
+        0x03,
+        0x04,
+        0,
+        0,
+    };
+    var cleartext_buf: [1]u8 = undefined;
+    try testing.expectError(error.TlsBadVersion, conn.decrypt(&invalid_record, &cleartext_buf));
+    try testing.expectEqual(.fatal_alert_pending, conn.inner.state);
+
+    var ciphertext_buf: [64]u8 = undefined;
+    const fatal_alert = try conn.close(&ciphertext_buf);
+    try testing.expect(fatal_alert.len > 0);
+    try testing.expectEqual(.failed, conn.inner.state);
+    try testing.expectEqual(0, (try conn.close(&ciphertext_buf)).len);
+    try testing.expectError(error.TlsConnectionFailed, conn.encrypt("data", &ciphertext_buf));
+}
+
+test "nonblock graceful close is idempotent" {
+    const client_cipher, _ = cipher.testCiphers();
+    var conn = NonBlock.init(client_cipher);
+    var ciphertext_buf: [64]u8 = undefined;
+
+    try testing.expect((try conn.close(&ciphertext_buf)).len > 0);
+    try testing.expectEqual(.close_sent, conn.inner.state);
+    try testing.expectEqual(0, (try conn.close(&ciphertext_buf)).len);
+    try testing.expectError(error.TlsConnectionFailed, conn.encrypt("data", &ciphertext_buf));
 }
