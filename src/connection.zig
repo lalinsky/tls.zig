@@ -259,7 +259,8 @@ pub const Connection = struct {
                 },
                 .alert => {
                     if (cleartext.len < 2) return error.TlsUnexpectedMessage;
-                    const alert = proto.Alert.parse(cleartext[0..2].*);
+                    // Decide on the description alone; see `Alert.parse`.
+                    const alert = proto.Alert.parse(cleartext[0..2].*).description;
                     if (alert == .user_canceled) continue;
                     if (alert == .close_notify) {
                         c.state = if (c.state == .close_sent) .closed else .peer_closed;

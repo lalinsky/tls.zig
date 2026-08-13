@@ -356,6 +356,7 @@ test {
 
     _ = @import("connection.zig");
     _ = @import("cipher.zig");
+    _ = @import("protocol.zig");
     _ = @import("record.zig");
     _ = @import("transcript.zig");
     _ = @import("PrivateKey.zig");
