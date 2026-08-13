@@ -274,8 +274,8 @@ pub fn get(
     var writer = tcp.writer(io, &output_buf);
     var cli = tls.client(&reader.interface, &writer.interface, opt) catch |err| {
         return switch (err) {
-            error.ReadFailed => reader.err orelse err,
-            error.WriteFailed => writer.err orelse err,
+            error.TransportReadFailed => reader.err orelse err,
+            error.TransportWriteFailed => writer.err orelse err,
             else => err,
         };
     };

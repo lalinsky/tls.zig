@@ -205,6 +205,20 @@ pub const Alert = enum(u8) {
         return false;
     }
 
+    /// Compile-time check that `E` names its transport failures rather than
+    /// carrying std's generic ones. `forLocalError` takes `anyerror` and so
+    /// cannot notice them itself: they would fall through to `internal_error`
+    /// and we would alert a peer about our own broken socket. Callers assert
+    /// here instead, where the concrete set is still known.
+    pub fn assertNamesTransportFailures(comptime E: type) void {
+        const mem = @import("std").mem;
+        for (@typeInfo(E).error_set.?) |e| {
+            if (mem.eql(u8, e.name, "ReadFailed") or mem.eql(u8, e.name, "WriteFailed"))
+                @compileError("error set carries std's " ++ e.name ++
+                    "; name the transport failure so it is not mistaken for a protocol error");
+        }
+    }
+
     /// The alert describing a failure we detected locally, or null when the
     /// peer should not be sent one: it already told us about its own failure,
     /// or the transport is gone and there is nothing to send on.

@@ -89,8 +89,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, domain: []const u8, root_ca: tls.conf
             },
             // canceled errors
             error.Canceled,
-            error.ReadFailed,
-            error.WriteFailed,
+            error.TransportReadFailed,
+            error.TransportWriteFailed,
             => {
                 counter.add(io, .skip);
                 if (!only_fail) {

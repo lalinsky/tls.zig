@@ -37,8 +37,8 @@ pub fn main(init: std.process.Init) !void {
         .now = std.Io.Clock.real.now(io),
         .rng = rng_impl.interface(),
     }) catch |err| return switch (err) {
-        error.ReadFailed => tcp_reader.err orelse err,
-        error.WriteFailed => tcp_writer.err orelse err,
+        error.TransportReadFailed => tcp_reader.err orelse err,
+        error.TransportWriteFailed => tcp_writer.err orelse err,
         else => err,
     };
 

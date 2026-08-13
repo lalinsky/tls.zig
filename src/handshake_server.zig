@@ -98,7 +98,8 @@ pub const Handshake = struct {
     /// writer and can be `error.Canceled`; dropping it would lose a
     /// cancellation. A dead transport also outranks the protocol error it
     /// would have replaced, since the peer will never see the alert anyway.
-    fn writeAlert(h: *Self, cph: ?*Cipher, err: anyerror) !void {
+    fn writeAlert(h: *Self, cph: ?*Cipher, err: anytype) !void {
+        comptime proto.Alert.assertNamesTransportFailures(@TypeOf(err));
         const cleartext = proto.alertForLocalError(err) orelse return;
         if (cph) |c| {
             const ciphertext = try c.encrypt(h.output.unusedCapacitySlice(), .alert, &cleartext);
