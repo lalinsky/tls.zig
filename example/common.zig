@@ -294,6 +294,11 @@ pub fn get(
         error.TransportReadFailed => {
             return reader.err orelse err;
         },
+        // The server closed the transport without close_notify. Most real
+        // servers do that after a `Connection: close` response, and HTTP
+        // delimits its own messages, so there is nothing here for TLS to
+        // protect: treat it as the end of the response.
+        error.TlsUnexpectedEof => null,
         else => return err,
     }) |data| {
         n += data.len;
