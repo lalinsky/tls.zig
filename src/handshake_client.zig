@@ -1108,12 +1108,12 @@ test "tls 1.3 decrypt wrapped record" {
 }
 
 test "tls 1.3 process server flight" {
-    var h: Handshake = brk: {
-        var buffer: [1024]u8 = undefined;
-        var writer: Io.Writer = .fixed(&buffer);
-        var reader: Io.Reader = .fixed(&data13.server_flight);
-        break :brk .{ .input = &reader, .output = &writer };
-    };
+    // `writer` and `reader` have to outlive `h`, which holds pointers to
+    // them, so they cannot live in a nested block.
+    var writer_buf: [1024]u8 = undefined;
+    var writer: Io.Writer = .fixed(&writer_buf);
+    var reader: Io.Reader = .fixed(&data13.server_flight);
+    var h: Handshake = .{ .input = &reader, .output = &writer };
     try initExampleHandshake(&h);
 
     h.cert = .{ .host = "example.ulfheim.net", .skip_verify = true, .root_ca = .empty, .now_sec = 0 };
@@ -1216,12 +1216,15 @@ test "client hello size" {
 }
 
 test "handshake verify server finished message" {
-    var h: Handshake = brk: {
-        var buffer: [1024]u8 = undefined;
-        var writer: Io.Writer = .fixed(&buffer);
-        var reader: Io.Reader = .fixed(&data12.server_handshake_finished_msgs);
-        break :brk .{ .input = &reader, .output = &writer };
-    };
+    // `writer` and `reader` have to outlive `h`, which holds pointers to
+    // them, so they cannot live in a nested block.
+    var buffer: [1024]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    // Records are decrypted in place inside the reader's buffer, so the test
+    // data has to be writable; `var` makes a mutable copy of it.
+    var msgs = data12.server_handshake_finished_msgs;
+    var reader: Io.Reader = .fixed(&msgs);
+    var h: Handshake = .{ .input = &reader, .output = &writer };
 
     h.cipher_suite = .ECDHE_ECDSA_WITH_AES_128_CBC_SHA;
     h.master_secret = data12.master_secret;
