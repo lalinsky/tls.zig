@@ -97,11 +97,16 @@ pub const Connection = struct {
             // cleartext starts from the beginning of the buffer, so ciphertext
             // is always ahead of cleartext.
             const cleartext_buf = if (buffer.len >= rec.payload.len) buffer else @constCast(rec.buffer);
-            const content_type, const cleartext = try c.cipher.decrypt(cleartext_buf, rec);
+            const content_type, const cleartext = c.cipher.decrypt(cleartext_buf, rec) catch |err| switch (err) {
+                // Do not expose distinguishable record deprotection failures.
+                error.TlsDecryptError, error.TlsBadRecordMac => return error.TlsBadRecordMac,
+                else => return err,
+            };
 
             switch (content_type) {
                 .application_data => {},
                 .handshake => {
+                    if (cleartext.len == 0) return error.TlsUnexpectedMessage;
                     const handshake_type: proto.Handshake = @enumFromInt(cleartext[0]);
                     switch (handshake_type) {
                         .new_session_ticket => {
