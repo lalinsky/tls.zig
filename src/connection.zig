@@ -53,7 +53,9 @@ pub const Connection = struct {
     };
 
     pub const ReadError = error{
-        ReadFailed,
+        /// The reader underneath us failed. Its own error, the one that says
+        /// what actually went wrong, is recorded on that reader.
+        TransportReadFailed,
         InputBufferUndersize,
         TlsUnexpectedEof,
         TlsTruncated,
@@ -68,7 +70,9 @@ pub const Connection = struct {
     } || proto.Alert.Error;
 
     pub const WriteError = error{
-        WriteFailed,
+        /// The writer underneath us failed. Its own error, the one that says
+        /// what actually went wrong, is recorded on that writer.
+        TransportWriteFailed,
         TlsCipherNoSpaceLeft,
         TlsUnexpectedMessage,
         TlsConnectionFailed,
@@ -84,7 +88,7 @@ pub const Connection = struct {
             error.TlsDecodeError => .decode_error,
             error.TlsUnexpectedMessage => .unexpected_message,
             error.TlsIllegalParameter => .illegal_parameter,
-            error.ReadFailed,
+            error.TransportReadFailed,
             error.InputBufferUndersize,
             error.TlsCipherNoSpaceLeft,
             error.TlsUnexpectedEof,
@@ -156,18 +160,18 @@ pub const Connection = struct {
 
     fn encryptWrite(c: *Self, content_type: proto.ContentType, bytes: []const u8) WriteError!void {
         const encrypted_len = c.cipher.recordLen(bytes.len);
-        const writable = c.output.writableSliceGreedy(encrypted_len) catch |err| {
+        const writable = c.output.writableSliceGreedy(encrypted_len) catch {
             c.state = .failed;
-            return err;
+            return error.TransportWriteFailed;
         };
         const rec = c.cipher.encrypt(writable, content_type, bytes) catch |err| {
             c.state = .failed;
             return err;
         };
         c.output.advance(rec.len);
-        c.output.flush() catch |err| {
+        c.output.flush() catch {
             c.state = .failed;
-            return err;
+            return error.TransportWriteFailed;
         };
     }
 
@@ -209,7 +213,11 @@ pub const Connection = struct {
                     else
                         error.TlsTruncated;
                 },
-                else => return err,
+                // The generic error from the reader below carries nothing;
+                // say so, and leave the real cause on that reader.
+                error.ReadFailed => return error.TransportReadFailed,
+                error.InputBufferUndersize => return error.InputBufferUndersize,
+                error.TlsRecordOverflow => return error.TlsRecordOverflow,
             };
             if (rec.protocol_version != .tls_1_2) return error.TlsBadVersion;
 
@@ -310,16 +318,16 @@ pub const Connection = struct {
     /// reading failed, otherwise sends close_notify. Repeated calls are no-ops.
     pub fn close(c: *Self) WriteError!void {
         if (c.state == .close_sent or c.state == .closed or c.state == .failed) return;
-        const writable = c.output.writableSliceGreedy(c.cipher.recordLen(2)) catch |err| {
+        const writable = c.output.writableSliceGreedy(c.cipher.recordLen(2)) catch {
             c.pending_alert = null;
             c.state = .failed;
-            return err;
+            return error.TransportWriteFailed;
         };
         const rec = (try c.encodeClose(writable)) orelse return;
         c.output.advance(rec.len);
-        c.output.flush() catch |err| {
+        c.output.flush() catch {
             c.state = .failed;
-            return err;
+            return error.TransportWriteFailed;
         };
     }
 
@@ -763,7 +771,7 @@ test "read queues protocol alert without writing" {
     try testing.expectError(error.TlsConnectionFailed, conn.read(&cleartext));
 }
 
-test "reader records ReadFailed for a lower-layer failure" {
+test "reader records TransportReadFailed for a lower-layer failure" {
     const FailingReader = struct {
         interface: Io.Reader,
         err: ?error{Canceled} = null,
@@ -797,8 +805,10 @@ test "reader records ReadFailed for a lower-layer failure" {
     var tls_buf: [1]u8 = undefined;
     var tls_reader = conn.reader(&tls_buf);
 
+    // The interface still reports the generic error, as it must, but `err`
+    // now says which layer failed instead of echoing it back.
     try testing.expectError(error.ReadFailed, tls_reader.interface.take(1));
-    try testing.expectEqual(error.ReadFailed, tls_reader.err.?);
+    try testing.expectEqual(error.TransportReadFailed, tls_reader.err.?);
     try testing.expectEqual(error.Canceled, transport_reader.err.?);
     try testing.expectEqual(.open, conn.state);
 }
@@ -923,7 +933,7 @@ test "failed fatal alert write is terminal and is not retried" {
         .pending_alert = .decode_error,
     };
 
-    try testing.expectError(error.WriteFailed, conn.close());
+    try testing.expectError(error.TransportWriteFailed, conn.close());
     try testing.expectEqual(.failed, conn.state);
     try testing.expectEqual(@as(?proto.Alert, null), conn.pending_alert);
     const end = output.interface.end;
