@@ -284,14 +284,14 @@ pub fn get(
     var buf: [256]u8 = undefined;
     const req = try std.fmt.bufPrint(&buf, "GET / HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{host});
     cli.writeAll(req) catch |err| {
-        return if (err == error.WriteFailed) writer.err orelse err else err;
+        return if (err == error.TransportWriteFailed) writer.err orelse err else err;
     };
 
     // Read and print http response
     var n: usize = 0;
     defer if (show_response) std.debug.print("{} bytes read\n", .{n});
     while (cli.next() catch |err| switch (err) {
-        error.ReadFailed => {
+        error.TransportReadFailed => {
             return reader.err orelse err;
         },
         else => return err,
@@ -309,7 +309,7 @@ pub fn get(
     }
 
     cli.close() catch |err| switch (err) {
-        error.WriteFailed => {
+        error.TransportWriteFailed => {
             return writer.err orelse err;
         },
         else => return err,

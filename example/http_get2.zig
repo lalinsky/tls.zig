@@ -49,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
         var buf: [256]u8 = undefined;
         const req = try std.fmt.bufPrint(&buf, "GET / HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{host});
         conn.writeAll(req) catch |err| return switch (err) {
-            error.WriteFailed => tcp_writer.err orelse err,
+            error.TransportWriteFailed => tcp_writer.err orelse err,
             else => err,
         };
     }
@@ -58,16 +58,18 @@ pub fn main(init: std.process.Init) !void {
     var http_reader_buf: [4096]u8 = undefined;
     var http_reader = conn.reader(&http_reader_buf);
     readHttpResponse(gpa, &http_reader.interface) catch |err| return switch (err) {
+        // The Io.Reader interface reports the generic error; walk down the
+        // layers until one of them says what actually happened.
         error.ReadFailed => brk: {
             const tls_err = http_reader.err orelse break :brk err;
-            if (tls_err != error.ReadFailed) break :brk tls_err;
+            if (tls_err != error.TransportReadFailed) break :brk tls_err;
             break :brk tcp_reader.err orelse tls_err;
         },
         else => err,
     };
 
     conn.close() catch |err| return switch (err) {
-        error.WriteFailed => tcp_writer.err orelse err,
+        error.TransportWriteFailed => tcp_writer.err orelse err,
         else => err,
     };
 }

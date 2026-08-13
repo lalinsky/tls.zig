@@ -215,6 +215,8 @@ pub const Alert = enum(u8) {
             // in most cases there is no longer a connection to send on.
             error.ReadFailed,
             error.WriteFailed,
+            error.TransportReadFailed,
+            error.TransportWriteFailed,
             error.EndOfStream,
             error.TlsUnexpectedEof,
             error.TlsTruncated,
