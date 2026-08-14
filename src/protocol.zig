@@ -234,6 +234,13 @@ pub const Alert = enum(u8) {
         return alert;
     }
 
+    pub fn format(alert: Alert) [2]u8 {
+        return [2]u8{
+            @intFromEnum(if (alert == .close_notify) Alert.Level.warning else Alert.Level.fatal),
+            @intFromEnum(alert),
+        };
+    }
+
     pub fn closeNotify() [2]u8 {
         return [2]u8{
             @intFromEnum(Alert.Level.warning),
