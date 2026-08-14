@@ -223,7 +223,7 @@ pub const Counter = struct {
 test "failRate" {
     var c: Counter = .{ .success = 6234, .fail = 1, .err = 14 };
     try std.testing.expect(c.failRate() < 0.005);
-    std.debug.print("rate: {}\n", .{c.failRate() * 1000});
+    //std.debug.print("rate: {}\n", .{c.failRate() * 1000});
 }
 
 pub fn get(
