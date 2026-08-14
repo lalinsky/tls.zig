@@ -230,6 +230,11 @@ pub const CertificateBuilder = struct {
     pub fn makeCertificateVerify(h: CertificateBuilder, w: *record.Writer) !void {
         // Creates signature for client certificate signature message.
         // Returns signature bytes and signature scheme.
+        //
+        // Every branch below returns a slice pointing into this buffer, so it
+        // has to outlive the switch. 512 bytes is the largest of the three: an
+        // RSA-4096 signature. ECDSA DER and Ed25519 are much smaller.
+        var buf: [512]u8 = undefined;
         const signature, const signature_scheme = switch (h.cert_key_pair.key.signature_scheme) {
             inline .ecdsa_secp256r1_sha256,
             .ecdsa_secp384r1_sha384,
@@ -243,8 +248,10 @@ pub const CertificateBuilder = struct {
                 var signer = try key_pair.signer(null);
                 h.setSignatureVerifyBytes(&signer);
                 const signature = try signer.finalize();
-                var buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
-                break :brk .{ signature.toDer(&buf), comptime_scheme };
+                break :brk .{
+                    signature.toDer(buf[0..Ecdsa.Signature.der_encoded_length_max]),
+                    comptime_scheme,
+                };
             },
             inline .rsa_pss_rsae_sha256,
             .rsa_pss_rsae_sha384,
@@ -253,7 +260,6 @@ pub const CertificateBuilder = struct {
                 const Hash = SchemeHash(comptime_scheme);
                 var signer = try h.cert_key_pair.key.key.rsa.signerOaep(Hash, null);
                 h.setSignatureVerifyBytes(&signer);
-                var buf: [512]u8 = undefined;
                 const signature = try signer.finalize(&buf, h.rng);
                 break :brk .{ signature.bytes, comptime_scheme };
             },
@@ -269,9 +275,8 @@ pub const CertificateBuilder = struct {
                 else
                     h.transcript.clientCertificateVerify();
                 const signature = try h.cert_key_pair.key.key.ed25519.sign(message, null);
-                var buf: [Eddsa.Signature.encoded_length]u8 = undefined;
-                buf = signature.toBytes();
-                break :brk .{ &buf, .ed25519 };
+                buf[0..Eddsa.Signature.encoded_length].* = signature.toBytes();
+                break :brk .{ buf[0..Eddsa.Signature.encoded_length], .ed25519 };
             },
             else => return error.TlsUnknownSignatureScheme,
         };
@@ -605,4 +610,73 @@ test "CertificateBuilder.makeCertificateVerify ed25519" {
     const Eddsa = crypto.sign.Ed25519;
     const sig = Eddsa.Signature.fromBytes(signature[0..Eddsa.Signature.encoded_length].*);
     try sig.verify(transcript.serverCertificateVerify(), cert_key_pair.key.key.ed25519.public_key);
+}
+
+/// Signs an empty server transcript with `key_pem` and returns the decoded
+/// CertificateVerify body, so a test can check the signature the peer sees.
+fn testCertificateVerify(
+    key_pem: []const u8,
+    buf: []u8,
+    transcript: *Transcript,
+) !struct { proto.SignatureScheme, []const u8 } {
+    // Bundle is unused by makeCertificateVerify (it only signs the
+    // transcript with cert_key_pair.key), so an empty one is fine here.
+    const key = try PrivateKey.parsePem(key_pem);
+    var cert_key_pair = CertKeyPair{
+        .bundle = .{ .map = .{}, .bytes = .{ .items = &.{}, .capacity = 0 } },
+        .key = key,
+        // The ecdsa branch signs with this cached pair, not with `key`.
+        .ecdsa_key_pair = try CertKeyPair.EcdsaKeyPair.init(key),
+    };
+    var prng = std.Random.DefaultPrng.init(0);
+    const cb = CertificateBuilder{
+        .cert_key_pair = &cert_key_pair,
+        .transcript = transcript,
+        .side = .server,
+        .rng = prng.random(),
+    };
+
+    var w = record.Writer.init(buf);
+    try cb.makeCertificateVerify(&w);
+
+    // Decode as a peer would off the wire; skip 1-byte type + u24 length.
+    var d = record.Decoder.init(.handshake, w.buffered()[4..]);
+    const scheme = try d.decode(proto.SignatureScheme);
+    return .{ scheme, try d.slice(try d.decode(u16)) };
+}
+
+test "CertificateBuilder.makeCertificateVerify ecdsa" {
+    var transcript = Transcript{};
+    var buf: [256]u8 = undefined;
+    const scheme, const signature = try testCertificateVerify(
+        @embedFile("testdata/ec_prime256v1_private_key.pem"),
+        &buf,
+        &transcript,
+    );
+    try testing.expectEqual(.ecdsa_secp256r1_sha256, scheme);
+
+    const Ecdsa = crypto.sign.ecdsa.EcdsaP256Sha256;
+    const pk = try PrivateKey.parsePem(@embedFile("testdata/ec_prime256v1_private_key.pem"));
+    const secret_key = try Ecdsa.SecretKey.fromBytes(
+        pk.key.ecdsa[0..Ecdsa.SecretKey.encoded_length].*,
+    );
+    const key_pair = try Ecdsa.KeyPair.fromSecretKey(secret_key);
+    const sig = try Ecdsa.Signature.fromDer(signature);
+    try sig.verify(transcript.serverCertificateVerify(), key_pair.public_key);
+}
+
+test "CertificateBuilder.makeCertificateVerify rsa" {
+    var transcript = Transcript{};
+    var buf: [1024]u8 = undefined;
+    const scheme, const signature = try testCertificateVerify(
+        @embedFile("testdata/rsa_private_key.pem"),
+        &buf,
+        &transcript,
+    );
+    try testing.expectEqual(.rsa_pss_rsae_sha256, scheme);
+
+    const pk = try PrivateKey.parsePem(@embedFile("testdata/rsa_private_key.pem"));
+    const Pss = rsa.Pss(crypto.hash.sha2.Sha256);
+    const sig = Pss.Signature{ .bytes = signature };
+    try sig.verify(transcript.serverCertificateVerify(), pk.key.rsa.public, null);
 }
