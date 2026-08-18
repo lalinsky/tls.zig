@@ -1070,6 +1070,15 @@ pub const NonBlock = struct {
 
         var n: usize = 0;
         while (n < cleartext.len and input.buffered().len > 0) {
+            // A trailing partial record is not an error in the nonblock
+            // API: the caller accumulates ciphertext and calls again with
+            // more. The record reader cannot tell the missing bytes apart
+            // from a truncated stream (which fails the connection state
+            // permanently), so stop before it ever sees them.
+            const buffered = input.buffered();
+            if (buffered.len < record.header_len) break;
+            const record_len = record.header_len + std.mem.readInt(u16, buffered[3..][0..2], .big);
+            if (buffered.len < record_len) break;
             const nn = self.inner.read(cleartext[n..]) catch |err| switch (err) {
                 error.InputBufferUndersize => break,
                 else => return err,
@@ -1134,6 +1143,29 @@ test "nonblock decrypt" {
 
     const res = try conn.decrypt(&ciphertext, &cleartext_buf);
     try testing.expectEqualSlices(u8, "ping", res.cleartext);
+}
+
+test "nonblock decrypt with a trailing partial record" {
+    const data13 = @import("testdata/tls13.zig");
+    _, const server_cipher = cipher.testCiphers();
+
+    const rec = data13.client_ping_wrapped;
+    var buf: [2 * rec.len]u8 = undefined;
+    @memcpy(buf[0..rec.len], &rec);
+    @memcpy(buf[rec.len..], &rec);
+
+    // One complete record followed by any partial second record must
+    // decrypt the first and leave the tail unconsumed, without failing
+    // the connection state.
+    for (1..rec.len - 1) |i| {
+        var conn = NonBlock.init(server_cipher);
+        var cleartext_buf: [32]u8 = undefined;
+        const res = try conn.decrypt(buf[0 .. rec.len + i], &cleartext_buf);
+        try testing.expectEqual(rec.len, res.ciphertext_pos);
+        try testing.expectEqualSlices(u8, "ping", res.cleartext);
+        try testing.expectEqual(i, res.unused_ciphertext.len);
+        try testing.expectEqual(.open, conn.inner.state);
+    }
 }
 
 test "nonblock key update is included in encryptedLength" {
