@@ -9,18 +9,13 @@ const cipher = @import("cipher.zig");
 const Cipher = cipher.Cipher;
 const SessionResumption = @import("handshake_client.zig").Options.SessionResumption;
 
-/// Established TLS connection: encrypts what is written, decrypts what is
-/// read, and tracks the close/alert state shared by the two directions.
+/// Established TLS connection: encrypts writes, decrypts reads, and tracks
+/// the close/alert state shared by the two directions.
 ///
-/// Concurrency: one reader and one writer may use the connection at the
-/// same time -- one task in `next`/`read*`/`readv`/`eof`, another in
-/// `write`/`writeAll`. The cipher's encrypt and decrypt halves are disjoint
-/// state (key updates included: each regenerates only its own direction's
-/// keys), and the fields both directions share (`state`,
-/// `key_update_requested`, `pending_alert`) are accessed atomically. The
-/// transport is not covered by any of this: `close` writes to `output`, so
-/// it belongs to the writing task, or to teardown after both tasks are
-/// done. Two readers or two writers are not supported.
+/// One concurrent reader plus one concurrent writer are supported: the
+/// cipher's encrypt and decrypt halves are disjoint, and the shared fields
+/// are accessed atomically. `close` writes to `output`, so it belongs to
+/// the writing task, or to teardown after both tasks are done.
 pub const Connection = struct {
     /// Underlying network connection stream reader/writer pair.
     input: *Io.Reader, // source of the encrypted (ciphertext) data
@@ -29,16 +24,11 @@ pub const Connection = struct {
 
     max_encrypt_seq: u64 = std.math.maxInt(u64) - 1,
     key_update_requested: bool = false,
-    /// Shared by the reading and the writing side; all accesses are atomic.
-    /// Every transition moves forward through the enum's little DAG (`open`
-    /// toward `closed`/`failed`), so a lost CAS race means the state
-    /// advanced and the loser merges rather than retries.
+    /// Shared by both directions; accessed atomically, transitions only
+    /// move forward (`open` toward `closed`/`failed`).
     state: State = .open,
-    /// The alert queued by the read side for `close` to send. Written by
-    /// the read side before it publishes `.fatal_alert_pending` with a
-    /// release store; the write side reads it only after observing that
-    /// state with an acquire load, by which time the read side is done
-    /// with it (all further reads short-circuit).
+    /// Queued by the read side, sent by `close`; handed over through the
+    /// release/acquire pair on `state`.
     pending_alert: ?proto.Alert = null,
     /// Part of the cleartext record returned from next but not yet read by client.
     cleartext_buf: []const u8 = &.{},
@@ -145,11 +135,8 @@ pub const Connection = struct {
             => return,
         };
         c.pending_alert = alert;
-        // Publish the alert. The release pairs with the acquire in
-        // `encodeClose`, so whoever sees `.fatal_alert_pending` also sees
-        // `pending_alert`. CAS rather than store, so the terminal `.failed`
-        // stays terminal: when the write side already failed the transport,
-        // there is nothing to send the alert on.
+        // Release pairs with the acquire in `encodeClose`; CAS so the
+        // terminal `.failed` stays terminal.
         var state = @atomicLoad(State, &c.state, .monotonic);
         while (state == .open or state == .close_sent) {
             state = @cmpxchgWeak(State, &c.state, state, .fatal_alert_pending, .release, .monotonic) orelse return;
@@ -161,16 +148,9 @@ pub const Connection = struct {
             @atomicLoad(bool, &c.key_update_requested, .monotonic);
     }
 
-    /// True when a key update must go out before the next record: the
-    /// cipher ran up to its sequence limit, or the peer requested one. The
-    /// request flag is claimed -- exchanged for false -- before the update
-    /// it decides is sent, so a request the read side stores between the
-    /// claim and the send stays set and is answered before the record
-    /// after this one. Clearing the flag after the send instead would
-    /// erase such a request. The update sent for this claim also answers
-    /// any requests received up to it, so claiming on the sequence-limit
-    /// path too costs nothing (rfc 8446: multiple KeyUpdates received
-    /// while silent get a single response).
+    /// True when a key update must go out before the next record. Claims
+    /// the peer's request before the response is sent; a request stored
+    /// after the claim stays set for the next record.
     fn claimKeyUpdate(c: *Self) bool {
         const requested = @atomicLoad(bool, &c.key_update_requested, .monotonic) and
             @atomicRmw(bool, &c.key_update_requested, .Xchg, false, .monotonic);
@@ -202,8 +182,7 @@ pub const Connection = struct {
         try c.encryptWrite(content_type, bytes);
     }
 
-    /// `.failed` is terminal in both directions, so it is a plain atomic
-    /// store: whatever transition it races with, failed wins.
+    /// Terminal in both directions, so a plain store wins any race.
     fn fail(c: *Self) void {
         @atomicStore(State, &c.state, .failed, .monotonic);
     }
@@ -319,10 +298,7 @@ pub const Connection = struct {
                     const alert = proto.Alert.parse(cleartext[0..2].*).description;
                     if (alert == .user_canceled) continue;
                     if (alert == .close_notify) {
-                        // open -> peer_closed, close_sent -> closed. Either
-                        // CAS loses only to the write side racing a close of
-                        // its own, in which case the state it moved to is
-                        // the one to advance from; `.failed` stays put.
+                        // open -> peer_closed, close_sent -> closed; `.failed` stays put.
                         if (@cmpxchgStrong(State, &c.state, .open, .peer_closed, .monotonic, .monotonic)) |cur| {
                             if (cur == .close_sent) {
                                 _ = @cmpxchgStrong(State, &c.state, .close_sent, .closed, .monotonic, .monotonic);
@@ -349,9 +325,8 @@ pub const Connection = struct {
     }
 
     fn encodeClose(c: *Self, ciphertext: []u8) WriteError!?[]const u8 {
-        // The acquire pairs with the release in `queueAlert`: seeing
-        // `.fatal_alert_pending` means seeing `pending_alert` too, and from
-        // then on the read side never touches it again, so this side owns it.
+        // Acquire pairs with the release in `queueAlert`: after seeing
+        // `.fatal_alert_pending` this side owns `pending_alert`.
         const state = @atomicLoad(State, &c.state, .acquire);
         const cleartext, const next_state: State = switch (state) {
             .open => .{ proto.Alert.closeNotify(), .close_sent },
@@ -372,21 +347,14 @@ pub const Connection = struct {
         };
         if (state == .fatal_alert_pending) c.pending_alert = null;
 
-        // Commit. Encrypting advanced the cipher sequence, so a lost race
-        // must not re-encode; the record already made stays valid to send
-        // and only the resulting state merges. Only the transitions out of
-        // `.open` can lose (from the other two, the read side is already
-        // done making transitions): to the peer's own close_notify, in
-        // which case both sides are now closed, or to a read-side failure
-        // or queued alert, in which case the connection is done and the
-        // alert -- which would have to follow our close record -- is
-        // dropped.
+        // Encrypting advanced the cipher sequence, so a lost race (only
+        // possible out of `.open`) merges the state rather than re-encodes;
+        // the record already made stays valid to send.
         if (@cmpxchgStrong(State, &c.state, state, next_state, .monotonic, .monotonic)) |cur| {
             const merged: State = switch (cur) {
                 .peer_closed => .closed,
                 .failed, .fatal_alert_pending => .failed,
-                // The remaining states are this side's own transitions,
-                // which it cannot have raced with itself.
+                // this side's own transitions
                 .open, .close_sent, .closed => unreachable,
             };
             @atomicStore(State, &c.state, merged, .monotonic);
@@ -397,15 +365,11 @@ pub const Connection = struct {
     /// Closes the write side of the connection. Sends a queued fatal alert if
     /// reading failed, otherwise sends close_notify. Repeated calls are no-ops.
     pub fn close(c: *Self) WriteError!void {
-        // Early out only; `encodeClose` re-reads the state and decides.
         switch (@atomicLoad(State, &c.state, .monotonic)) {
             .close_sent, .closed, .failed => return,
             else => {},
         }
         const writable = c.output.writableSliceGreedy(c.cipher.recordLen(2)) catch {
-            // `pending_alert`, if set, is left in place: this side may not
-            // have observed the publishing state yet, so it may not touch
-            // the field. Nobody reads it after `.failed` anyway.
             c.fail();
             return error.TransportWriteFailed;
         };
@@ -1032,12 +996,8 @@ test "failed fatal alert write is terminal and is not retried" {
 }
 
 /// Sans-io connection: pure encrypt/decrypt over caller-provided buffers.
-///
-/// Each NonBlock is single-task: unlike the blocking `Connection`, nothing
-/// here is synchronized. For concurrent use make two copies of the same
-/// cipher, encrypt with one and decrypt with the other, and forward
-/// `inner.key_update_requested` (atomic) from the decrypting copy to the
-/// encrypting one.
+/// Single-task; for concurrent use split the cipher into two copies (one
+/// encrypting, one decrypting) and forward `inner.key_update_requested`.
 pub const NonBlock = struct {
     const Self = @This();
 
@@ -1098,11 +1058,8 @@ pub const NonBlock = struct {
         var n: usize = 0;
         var out_pos: usize = 0;
         while (n < cleartext.len) {
-            // Peek first, so bailing for want of buffer space does not
-            // consume the peer's request; claim only once the update is
-            // sure to go out. A request forwarded onto this copy between
-            // the two is still caught by the claim, and one arriving after
-            // it stays set for the next record.
+            // Peek, so bailing for buffer space does not consume the
+            // request; claim once the update is sure to go out.
             if (self.inner.keyUpdateNeeded()) {
                 const update_len = self.inner.cipher.recordLen(key_update.len);
                 if (ciphertext.len - out_pos < update_len) {
@@ -1330,9 +1287,8 @@ test "nonblock graceful close is idempotent" {
     try testing.expectError(error.TlsConnectionFailed, conn.encrypt("data", &ciphertext_buf));
 }
 
-/// A matched TLS 1.3 cipher pair with real (fixed) secrets, so key updates
-/// derive working keys on both sides; `cipher.testCiphers` leaves the
-/// secrets undefined.
+/// Matched TLS 1.3 cipher pair with real secrets, so key updates work
+/// (`cipher.testCiphers` leaves them undefined).
 fn testTls13CipherPair() !struct { Cipher, Cipher } {
     const Transcript = @import("transcript.zig").Transcript;
     const client_secret = [_]u8{1} ** 48;
@@ -1396,13 +1352,8 @@ test "Connection: close orderings converge on closed" {
 test "Connection: concurrent reader and writer" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    // One task reading, one task writing and finally closing, per the
-    // concurrency contract on `Connection`. The interesting assertions are
-    // the invariants at the end of every round: all cleartext arrived
-    // through a mid-stream key update, and the close handshake converged on
-    // `.closed` no matter how the two sides interleaved. Run under
-    // -fsanitize-thread this is also the data-race test for the shared
-    // state machine.
+    // Reader task vs writer task on one connection; under
+    // -fsanitize-thread this is the data-race test for the shared state.
     const msg = "0123456789abcdef";
     const rounds = 50;
 
@@ -1412,9 +1363,7 @@ test "Connection: concurrent reader and writer" {
         }
         fn writer(c: *Connection) void {
             for (0..16) |_| {
-                // Stops early when the peer's close_notify wins the race;
-                // the close below still answers it.
-                c.writeAll(msg) catch break;
+                c.writeAll(msg) catch break; // fails once the peer closed
             }
             c.close() catch {};
         }
@@ -1424,9 +1373,8 @@ test "Connection: concurrent reader and writer" {
         const pair = try testTls13CipherPair();
         var server_cipher = pair[1];
 
-        // Preload the transport with the peer's whole session: data, a key
-        // update demanding a response, more data under the new key, and
-        // finally close_notify.
+        // The peer's whole session: data, a key update demanding a
+        // response, more data under the new key, close_notify.
         var in_buf: [2048]u8 = undefined;
         var in_len: usize = 0;
         var expected: usize = 0;
@@ -1470,11 +1418,8 @@ test "Connection: concurrent reader and writer" {
 test "Connection: concurrent close races a queued fatal alert" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    // The reader hits a garbage record and queues a fatal alert while the
-    // writer is closing. Depending on who wins, the alert goes out through
-    // `close` (.failed), the writer's close_notify was already sent and the
-    // alert has nowhere to go (.fatal_alert_pending), or the writer loses
-    // the commit race and merges (.failed). Never a clean close.
+    // A garbage record queues a fatal alert while the writer closes; any
+    // interleaving ends failed or fatal_alert_pending, never a clean close.
     const msg = "0123456789abcdef";
     const rounds = 50;
 
@@ -1524,15 +1469,13 @@ test "Connection: peer key update request is claimed, answered, and round-trips"
     var conn: Connection = .{ .input = &input, .output = &output, .cipher = pair[0] };
     var peer = NonBlock.init(pair[1]);
 
-    // As if the read side had just processed the peer's update_requested.
+    // As if the read side had processed the peer's update_requested.
     @atomicStore(bool, &conn.key_update_requested, true, .monotonic);
     try conn.writeAll("ping");
-    // Claimed before the response was sent, not cleared after it: a
-    // request stored between the two would survive to the next record.
+    // Claimed before the response was sent, not cleared after it.
     try testing.expect(!@atomicLoad(bool, &conn.key_update_requested, .monotonic));
 
-    // The peer processes the KeyUpdate response transparently and reads
-    // the data under this side's new key.
+    // The peer reads the data through the KeyUpdate response.
     var cleartext_buf: [64]u8 = undefined;
     const res = try peer.decrypt(out_buf[0..output.end], &cleartext_buf);
     try testing.expectEqualStrings("ping", res.cleartext);

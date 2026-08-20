@@ -460,12 +460,8 @@ fn Aead13Type(comptime AeadType: type, comptime Hash: type) type {
             self.decrypt_iv = hkdfExpandLabel(Hkdf, self.decrypt_secret, "iv", "", nonce_len);
         }
 
-        // Each key update touches only its own direction's fields. That is
-        // what keeps the encrypt and decrypt halves disjoint, which the
-        // blocking Connection's one-reader-one-writer contract stands on:
-        // regenerating the other half here -- even to the same values,
-        // since its secret did not change -- would be a write racing the
-        // other side's use of it.
+        // Key updates touch only their own direction's fields; the other
+        // half may be in concurrent use (Connection's reader/writer split).
 
         pub fn keyUpdateEncrypt(self: *Self) void {
             self.encrypt_secret = hkdfExpandLabel(Hkdf, self.encrypt_secret, "traffic upd", "", digest_len);
