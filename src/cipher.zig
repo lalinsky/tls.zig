@@ -460,16 +460,25 @@ fn Aead13Type(comptime AeadType: type, comptime Hash: type) type {
             self.decrypt_iv = hkdfExpandLabel(Hkdf, self.decrypt_secret, "iv", "", nonce_len);
         }
 
+        // Each key update touches only its own direction's fields. That is
+        // what keeps the encrypt and decrypt halves disjoint, which the
+        // blocking Connection's one-reader-one-writer contract stands on:
+        // regenerating the other half here -- even to the same values,
+        // since its secret did not change -- would be a write racing the
+        // other side's use of it.
+
         pub fn keyUpdateEncrypt(self: *Self) void {
             self.encrypt_secret = hkdfExpandLabel(Hkdf, self.encrypt_secret, "traffic upd", "", digest_len);
             self.encrypt_seq = 0;
-            self.keyGenerate();
+            self.encrypt_key = hkdfExpandLabel(Hkdf, self.encrypt_secret, "key", "", key_len);
+            self.encrypt_iv = hkdfExpandLabel(Hkdf, self.encrypt_secret, "iv", "", nonce_len);
         }
 
         pub fn keyUpdateDecrypt(self: *Self) void {
             self.decrypt_secret = hkdfExpandLabel(Hkdf, self.decrypt_secret, "traffic upd", "", digest_len);
             self.decrypt_seq = 0;
-            self.keyGenerate();
+            self.decrypt_key = hkdfExpandLabel(Hkdf, self.decrypt_secret, "key", "", key_len);
+            self.decrypt_iv = hkdfExpandLabel(Hkdf, self.decrypt_secret, "iv", "", nonce_len);
         }
 
         /// Returns encrypted tls record in format:

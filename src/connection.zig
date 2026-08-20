@@ -15,7 +15,8 @@ const SessionResumption = @import("handshake_client.zig").Options.SessionResumpt
 /// Concurrency: one reader and one writer may use the connection at the
 /// same time -- one task in `next`/`read*`/`readv`/`eof`, another in
 /// `write`/`writeAll`. The cipher's encrypt and decrypt halves are disjoint
-/// state, and the fields both directions share (`state`,
+/// state (key updates included: each regenerates only its own direction's
+/// keys), and the fields both directions share (`state`,
 /// `key_update_requested`, `pending_alert`) are accessed atomically. The
 /// transport is not covered by any of this: `close` writes to `output`, so
 /// it belongs to the writing task, or to teardown after both tasks are
@@ -160,12 +161,28 @@ pub const Connection = struct {
             @atomicLoad(bool, &c.key_update_requested, .monotonic);
     }
 
+    /// True when a key update must go out before the next record: the
+    /// cipher ran up to its sequence limit, or the peer requested one. The
+    /// request flag is claimed -- exchanged for false -- before the update
+    /// it decides is sent, so a request the read side stores between the
+    /// claim and the send stays set and is answered before the record
+    /// after this one. Clearing the flag after the send instead would
+    /// erase such a request. The update sent for this claim also answers
+    /// any requests received up to it, so claiming on the sequence-limit
+    /// path too costs nothing (rfc 8446: multiple KeyUpdates received
+    /// while silent get a single response).
+    fn claimKeyUpdate(c: *Self) bool {
+        const requested = @atomicLoad(bool, &c.key_update_requested, .monotonic) and
+            @atomicRmw(bool, &c.key_update_requested, .Xchg, false, .monotonic);
+        return requested or c.cipher.encryptSeq() >= c.max_encrypt_seq;
+    }
+
     /// Encrypts and writes single tls record to the stream.
     fn writeRecord(c: *Self, content_type: proto.ContentType, bytes: []const u8) WriteError!void {
         assert(bytes.len <= cipher.max_cleartext_len);
         // If key update is requested send key update message and update
         // my encryption keys.
-        if (c.keyUpdateNeeded()) {
+        if (c.claimKeyUpdate()) {
             // If the request_update field is set to "update_requested",
             // then the receiver MUST send a KeyUpdate of its own with
             // request_update set to "update_not_requested" prior to sending
@@ -181,7 +198,6 @@ pub const Connection = struct {
                 c.fail();
                 return err;
             };
-            @atomicStore(bool, &c.key_update_requested, false, .monotonic);
         }
         try c.encryptWrite(content_type, bytes);
     }
@@ -1082,12 +1098,18 @@ pub const NonBlock = struct {
         var n: usize = 0;
         var out_pos: usize = 0;
         while (n < cleartext.len) {
+            // Peek first, so bailing for want of buffer space does not
+            // consume the peer's request; claim only once the update is
+            // sure to go out. A request forwarded onto this copy between
+            // the two is still caught by the claim, and one arriving after
+            // it stays set for the next record.
             if (self.inner.keyUpdateNeeded()) {
                 const update_len = self.inner.cipher.recordLen(key_update.len);
                 if (ciphertext.len - out_pos < update_len) {
                     if (out_pos == 0) return error.TlsCipherNoSpaceLeft;
                     break;
                 }
+                _ = self.inner.claimKeyUpdate();
                 const rec = self.inner.cipher.encrypt(ciphertext[out_pos..], .handshake, key_update) catch |err| {
                     self.inner.state = .failed;
                     return err;
@@ -1097,7 +1119,6 @@ pub const NonBlock = struct {
                     self.inner.state = .failed;
                     return err;
                 };
-                @atomicStore(bool, &self.inner.key_update_requested, false, .monotonic);
             }
 
             const overhead = self.inner.cipher.encryptOverhead();
@@ -1493,4 +1514,26 @@ test "Connection: concurrent close races a queued fatal alert" {
         const state = @atomicLoad(Connection.State, &conn.state, .monotonic);
         try testing.expect(state == .failed or state == .fatal_alert_pending);
     }
+}
+
+test "Connection: peer key update request is claimed, answered, and round-trips" {
+    const pair = try testTls13CipherPair();
+    var input: Io.Reader = .fixed(&.{});
+    var out_buf: [1024]u8 = undefined;
+    var output: Io.Writer = .fixed(&out_buf);
+    var conn: Connection = .{ .input = &input, .output = &output, .cipher = pair[0] };
+    var peer = NonBlock.init(pair[1]);
+
+    // As if the read side had just processed the peer's update_requested.
+    @atomicStore(bool, &conn.key_update_requested, true, .monotonic);
+    try conn.writeAll("ping");
+    // Claimed before the response was sent, not cleared after it: a
+    // request stored between the two would survive to the next record.
+    try testing.expect(!@atomicLoad(bool, &conn.key_update_requested, .monotonic));
+
+    // The peer processes the KeyUpdate response transparently and reads
+    // the data under this side's new key.
+    var cleartext_buf: [64]u8 = undefined;
+    const res = try peer.decrypt(out_buf[0..output.end], &cleartext_buf);
+    try testing.expectEqualStrings("ping", res.cleartext);
 }
