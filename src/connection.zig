@@ -9,6 +9,13 @@ const cipher = @import("cipher.zig");
 const Cipher = cipher.Cipher;
 const SessionResumption = @import("handshake_client.zig").Options.SessionResumption;
 
+/// Established TLS connection: encrypts writes, decrypts reads, and tracks
+/// the close/alert state shared by the two directions.
+///
+/// One concurrent reader plus one concurrent writer are supported: the
+/// cipher's encrypt and decrypt halves are disjoint, and the shared fields
+/// are accessed atomically. `close` writes to `output`, so it belongs to
+/// the writing task, or to teardown after both tasks are done.
 pub const Connection = struct {
     /// Underlying network connection stream reader/writer pair.
     input: *Io.Reader, // source of the encrypted (ciphertext) data
@@ -17,7 +24,11 @@ pub const Connection = struct {
 
     max_encrypt_seq: u64 = std.math.maxInt(u64) - 1,
     key_update_requested: bool = false,
+    /// Shared by both directions; accessed atomically, transitions only
+    /// move forward (`open` toward `closed`/`failed`).
     state: State = .open,
+    /// Queued by the read side, sent by `close`; handed over through the
+    /// release/acquire pair on `state`.
     pending_alert: ?proto.Alert = null,
     /// Part of the cleartext record returned from next but not yet read by client.
     cleartext_buf: []const u8 = &.{},
@@ -124,7 +135,12 @@ pub const Connection = struct {
             => return,
         };
         c.pending_alert = alert;
-        c.state = .fatal_alert_pending;
+        // Release pairs with the acquire in `encodeClose`; CAS so the
+        // terminal `.failed` stays terminal.
+        var state = @atomicLoad(State, &c.state, .monotonic);
+        while (state == .open or state == .close_sent) {
+            state = @cmpxchgWeak(State, &c.state, state, .fatal_alert_pending, .release, .monotonic) orelse return;
+        }
     }
 
     fn keyUpdateNeeded(c: *const Self) bool {
@@ -132,12 +148,21 @@ pub const Connection = struct {
             @atomicLoad(bool, &c.key_update_requested, .monotonic);
     }
 
+    /// True when a key update must go out before the next record. Claims
+    /// the peer's request before the response is sent; a request stored
+    /// after the claim stays set for the next record.
+    fn claimKeyUpdate(c: *Self) bool {
+        const requested = @atomicLoad(bool, &c.key_update_requested, .monotonic) and
+            @atomicRmw(bool, &c.key_update_requested, .Xchg, false, .monotonic);
+        return requested or c.cipher.encryptSeq() >= c.max_encrypt_seq;
+    }
+
     /// Encrypts and writes single tls record to the stream.
     fn writeRecord(c: *Self, content_type: proto.ContentType, bytes: []const u8) WriteError!void {
         assert(bytes.len <= cipher.max_cleartext_len);
         // If key update is requested send key update message and update
         // my encryption keys.
-        if (c.keyUpdateNeeded()) {
+        if (c.claimKeyUpdate()) {
             // If the request_update field is set to "update_requested",
             // then the receiver MUST send a KeyUpdate of its own with
             // request_update set to "update_not_requested" prior to sending
@@ -150,27 +175,31 @@ pub const Connection = struct {
             const key_update = &record.handshakeHeader(.key_update, 1) ++ [_]u8{0};
             try c.encryptWrite(.handshake, key_update);
             c.cipher.keyUpdateEncrypt() catch |err| {
-                c.state = .failed;
+                c.fail();
                 return err;
             };
-            @atomicStore(bool, &c.key_update_requested, false, .monotonic);
         }
         try c.encryptWrite(content_type, bytes);
+    }
+
+    /// Terminal in both directions, so a plain store wins any race.
+    fn fail(c: *Self) void {
+        @atomicStore(State, &c.state, .failed, .monotonic);
     }
 
     fn encryptWrite(c: *Self, content_type: proto.ContentType, bytes: []const u8) WriteError!void {
         const encrypted_len = c.cipher.recordLen(bytes.len);
         const writable = c.output.writableSliceGreedy(encrypted_len) catch {
-            c.state = .failed;
+            c.fail();
             return error.TransportWriteFailed;
         };
         const rec = c.cipher.encrypt(writable, content_type, bytes) catch |err| {
-            c.state = .failed;
+            c.fail();
             return err;
         };
         c.output.advance(rec.len);
         c.output.flush() catch {
-            c.state = .failed;
+            c.fail();
             return error.TransportWriteFailed;
         };
     }
@@ -195,7 +224,7 @@ pub const Connection = struct {
     /// record.
     fn nextRecord(c: *Self, buffer: []u8) RecordError![]const u8 {
         assert(c.cleartext_buf.len == 0);
-        switch (c.state) {
+        switch (@atomicLoad(State, &c.state, .monotonic)) {
             .open, .close_sent => {},
             .peer_closed, .closed => return error.EndOfStream,
             .fatal_alert_pending, .failed => return error.TlsConnectionFailed,
@@ -207,7 +236,7 @@ pub const Connection = struct {
                 // report which of the two it was: the stream ended between
                 // records, or in the middle of one.
                 error.EndOfStream => {
-                    c.state = .failed;
+                    c.fail();
                     return if (c.input.bufferedLen() == 0)
                         error.TlsUnexpectedEof
                     else
@@ -269,10 +298,15 @@ pub const Connection = struct {
                     const alert = proto.Alert.parse(cleartext[0..2].*).description;
                     if (alert == .user_canceled) continue;
                     if (alert == .close_notify) {
-                        c.state = if (c.state == .close_sent) .closed else .peer_closed;
+                        // open -> peer_closed, close_sent -> closed; `.failed` stays put.
+                        if (@cmpxchgStrong(State, &c.state, .open, .peer_closed, .monotonic, .monotonic)) |cur| {
+                            if (cur == .close_sent) {
+                                _ = @cmpxchgStrong(State, &c.state, .close_sent, .closed, .monotonic, .monotonic);
+                            }
+                        }
                         return error.EndOfStream;
                     }
-                    c.state = .failed;
+                    c.fail();
                     // toError only succeeds for close_notify and
                     // user_canceled, both handled above. Don't rely on that
                     // holding for peer controlled input.
@@ -286,11 +320,15 @@ pub const Connection = struct {
     }
 
     pub fn eof(c: *Self) bool {
-        return (c.state == .peer_closed or c.state == .closed) and c.cleartext_buf.len == 0;
+        const state = @atomicLoad(State, &c.state, .monotonic);
+        return (state == .peer_closed or state == .closed) and c.cleartext_buf.len == 0;
     }
 
     fn encodeClose(c: *Self, ciphertext: []u8) WriteError!?[]const u8 {
-        const cleartext, const next_state: State = switch (c.state) {
+        // Acquire pairs with the release in `queueAlert`: after seeing
+        // `.fatal_alert_pending` this side owns `pending_alert`.
+        const state = @atomicLoad(State, &c.state, .acquire);
+        const cleartext, const next_state: State = switch (state) {
             .open => .{ proto.Alert.closeNotify(), .close_sent },
             .peer_closed => .{ proto.Alert.closeNotify(), .closed },
             .fatal_alert_pending => .{ [2]u8{
@@ -303,28 +341,42 @@ pub const Connection = struct {
         if (ciphertext.len < c.cipher.recordLen(cleartext.len))
             return error.TlsCipherNoSpaceLeft;
         const rec = c.cipher.encrypt(ciphertext, .alert, &cleartext) catch |err| {
-            c.pending_alert = null;
-            c.state = .failed;
+            if (state == .fatal_alert_pending) c.pending_alert = null;
+            c.fail();
             return err;
         };
-        c.pending_alert = null;
-        c.state = next_state;
+        if (state == .fatal_alert_pending) c.pending_alert = null;
+
+        // Encrypting advanced the cipher sequence, so a lost race (only
+        // possible out of `.open`) merges the state rather than re-encodes;
+        // the record already made stays valid to send.
+        if (@cmpxchgStrong(State, &c.state, state, next_state, .monotonic, .monotonic)) |cur| {
+            const merged: State = switch (cur) {
+                .peer_closed => .closed,
+                .failed, .fatal_alert_pending => .failed,
+                // this side's own transitions
+                .open, .close_sent, .closed => unreachable,
+            };
+            @atomicStore(State, &c.state, merged, .monotonic);
+        }
         return rec;
     }
 
     /// Closes the write side of the connection. Sends a queued fatal alert if
     /// reading failed, otherwise sends close_notify. Repeated calls are no-ops.
     pub fn close(c: *Self) WriteError!void {
-        if (c.state == .close_sent or c.state == .closed or c.state == .failed) return;
+        switch (@atomicLoad(State, &c.state, .monotonic)) {
+            .close_sent, .closed, .failed => return,
+            else => {},
+        }
         const writable = c.output.writableSliceGreedy(c.cipher.recordLen(2)) catch {
-            c.pending_alert = null;
-            c.state = .failed;
+            c.fail();
             return error.TransportWriteFailed;
         };
         const rec = (try c.encodeClose(writable)) orelse return;
         c.output.advance(rec.len);
         c.output.flush() catch {
-            c.state = .failed;
+            c.fail();
             return error.TransportWriteFailed;
         };
     }
@@ -335,7 +387,7 @@ pub const Connection = struct {
     /// tls record. Max single tls record payload length is 1<<14 (16K)
     /// bytes.
     pub fn write(c: *Self, bytes: []const u8) WriteError!usize {
-        if (c.state != .open) return error.TlsConnectionFailed;
+        if (@atomicLoad(State, &c.state, .monotonic) != .open) return error.TlsConnectionFailed;
         const encrypt_overhead = c.cipher.encryptOverhead();
         assert(c.output.buffer.len > encrypt_overhead);
         // Find maximum number of bytes which can fit into output buffer as encrypted ciphertext
@@ -943,6 +995,9 @@ test "failed fatal alert write is terminal and is not retried" {
     try testing.expectError(error.TlsConnectionFailed, conn.write("data"));
 }
 
+/// Sans-io connection: pure encrypt/decrypt over caller-provided buffers.
+/// Single-task; for concurrent use split the cipher into two copies (one
+/// encrypting, one decrypting) and forward `inner.key_update_requested`.
 pub const NonBlock = struct {
     const Self = @This();
 
@@ -1003,12 +1058,15 @@ pub const NonBlock = struct {
         var n: usize = 0;
         var out_pos: usize = 0;
         while (n < cleartext.len) {
+            // Peek, so bailing for buffer space does not consume the
+            // request; claim once the update is sure to go out.
             if (self.inner.keyUpdateNeeded()) {
                 const update_len = self.inner.cipher.recordLen(key_update.len);
                 if (ciphertext.len - out_pos < update_len) {
                     if (out_pos == 0) return error.TlsCipherNoSpaceLeft;
                     break;
                 }
+                _ = self.inner.claimKeyUpdate();
                 const rec = self.inner.cipher.encrypt(ciphertext[out_pos..], .handshake, key_update) catch |err| {
                     self.inner.state = .failed;
                     return err;
@@ -1018,7 +1076,6 @@ pub const NonBlock = struct {
                     self.inner.state = .failed;
                     return err;
                 };
-                @atomicStore(bool, &self.inner.key_update_requested, false, .monotonic);
             }
 
             const overhead = self.inner.cipher.encryptOverhead();
@@ -1228,4 +1285,198 @@ test "nonblock graceful close is idempotent" {
     try testing.expectEqual(.close_sent, conn.inner.state);
     try testing.expectEqual(0, (try conn.close(&ciphertext_buf)).len);
     try testing.expectError(error.TlsConnectionFailed, conn.encrypt("data", &ciphertext_buf));
+}
+
+/// Matched TLS 1.3 cipher pair with real secrets, so key updates work
+/// (`cipher.testCiphers` leaves them undefined).
+fn testTls13CipherPair() !struct { Cipher, Cipher } {
+    const Transcript = @import("transcript.zig").Transcript;
+    const client_secret = [_]u8{1} ** 48;
+    const server_secret = [_]u8{2} ** 48;
+    const secret: Transcript.Secret = .{
+        .client = &client_secret,
+        .server = &server_secret,
+    };
+    return .{
+        try Cipher.initTls13(.AES_256_GCM_SHA384, secret, .client),
+        try Cipher.initTls13(.AES_256_GCM_SHA384, secret, .server),
+    };
+}
+
+test "Connection: close orderings converge on closed" {
+    { // The peer closes first; our close completes the pair.
+        const pair = try testTls13CipherPair();
+        var peer = NonBlock.init(pair[1]);
+        var close_buf: [64]u8 = undefined;
+        const peer_close = try peer.close(&close_buf);
+
+        var in_buf: [64]u8 = undefined;
+        @memcpy(in_buf[0..peer_close.len], peer_close);
+        var input: Io.Reader = .fixed(in_buf[0..peer_close.len]);
+        var out_buf: [64]u8 = undefined;
+        var output: Io.Writer = .fixed(&out_buf);
+        var conn: Connection = .{ .input = &input, .output = &output, .cipher = pair[0] };
+
+        try testing.expect((try conn.next()) == null);
+        try testing.expectEqual(.peer_closed, conn.state);
+        try testing.expectError(error.TlsConnectionFailed, conn.write("data"));
+        try conn.close();
+        try testing.expectEqual(.closed, conn.state);
+        try testing.expect(output.end > 0);
+    }
+    { // We close first; the peer's close_notify completes the pair.
+        const pair = try testTls13CipherPair();
+        var peer = NonBlock.init(pair[1]);
+        var close_buf: [64]u8 = undefined;
+        const peer_close = try peer.close(&close_buf);
+
+        var in_buf: [64]u8 = undefined;
+        @memcpy(in_buf[0..peer_close.len], peer_close);
+        var input: Io.Reader = .fixed(in_buf[0..peer_close.len]);
+        var out_buf: [64]u8 = undefined;
+        var output: Io.Writer = .fixed(&out_buf);
+        var conn: Connection = .{ .input = &input, .output = &output, .cipher = pair[0] };
+
+        try conn.close();
+        try testing.expectEqual(.close_sent, conn.state);
+        try testing.expectError(error.TlsConnectionFailed, conn.write("data"));
+        try testing.expect((try conn.next()) == null);
+        try testing.expectEqual(.closed, conn.state);
+        // Close already sent; nothing further goes out.
+        const sent = output.end;
+        try conn.close();
+        try testing.expectEqual(sent, output.end);
+    }
+}
+
+test "Connection: concurrent reader and writer" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // Reader task vs writer task on one connection; under
+    // -fsanitize-thread this is the data-race test for the shared state.
+    const msg = "0123456789abcdef";
+    const rounds = 50;
+
+    const Tasks = struct {
+        fn reader(c: *Connection, total: *usize) void {
+            while (c.next() catch null) |cleartext| total.* += cleartext.len;
+        }
+        fn writer(c: *Connection) void {
+            for (0..16) |_| {
+                c.writeAll(msg) catch break; // fails once the peer closed
+            }
+            c.close() catch {};
+        }
+    };
+
+    for (0..rounds) |_| {
+        const pair = try testTls13CipherPair();
+        var server_cipher = pair[1];
+
+        // The peer's whole session: data, a key update demanding a
+        // response, more data under the new key, close_notify.
+        var in_buf: [2048]u8 = undefined;
+        var in_len: usize = 0;
+        var expected: usize = 0;
+        for (0..4) |_| {
+            in_len += (try server_cipher.encrypt(in_buf[in_len..], .application_data, msg)).len;
+            expected += msg.len;
+        }
+        {
+            const key_update = &record.handshakeHeader(.key_update, 1) ++ [_]u8{1}; // update_requested
+            in_len += (try server_cipher.encrypt(in_buf[in_len..], .handshake, key_update)).len;
+            try server_cipher.keyUpdateEncrypt();
+        }
+        for (0..4) |_| {
+            in_len += (try server_cipher.encrypt(in_buf[in_len..], .application_data, msg)).len;
+            expected += msg.len;
+        }
+        in_len += (try server_cipher.encrypt(in_buf[in_len..], .alert, &proto.Alert.closeNotify())).len;
+
+        var input: Io.Reader = .fixed(in_buf[0..in_len]);
+        var out_buf: [8192]u8 = undefined;
+        var output: Io.Writer = .fixed(&out_buf);
+        var conn: Connection = .{
+            .input = &input,
+            .output = &output,
+            .cipher = pair[0],
+            // Force encrypt-side key updates mid-stream as well.
+            .max_encrypt_seq = 5,
+        };
+
+        var total: usize = 0;
+        const rt = try std.Thread.spawn(.{}, Tasks.reader, .{ &conn, &total });
+        const wt = try std.Thread.spawn(.{}, Tasks.writer, .{&conn});
+        rt.join();
+        wt.join();
+
+        try testing.expectEqual(expected, total);
+        try testing.expectEqual(.closed, @atomicLoad(Connection.State, &conn.state, .monotonic));
+    }
+}
+
+test "Connection: concurrent close races a queued fatal alert" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // A garbage record queues a fatal alert while the writer closes; any
+    // interleaving ends failed or fatal_alert_pending, never a clean close.
+    const msg = "0123456789abcdef";
+    const rounds = 50;
+
+    const Tasks = struct {
+        fn reader(c: *Connection) void {
+            while (c.next() catch null) |_| {}
+        }
+        fn writer(c: *Connection) void {
+            for (0..4) |_| c.writeAll(msg) catch break;
+            c.close() catch {};
+        }
+    };
+
+    for (0..rounds) |_| {
+        const pair = try testTls13CipherPair();
+        var server_cipher = pair[1];
+
+        var in_buf: [1024]u8 = undefined;
+        var in_len: usize = 0;
+        for (0..4) |_| {
+            in_len += (try server_cipher.encrypt(in_buf[in_len..], .application_data, msg)).len;
+        }
+        const tail = (try server_cipher.encrypt(in_buf[in_len..], .application_data, msg)).len;
+        in_buf[in_len + tail - 1] +%= 1; // corrupt the last record's tag
+        in_len += tail;
+
+        var input: Io.Reader = .fixed(in_buf[0..in_len]);
+        var out_buf: [4096]u8 = undefined;
+        var output: Io.Writer = .fixed(&out_buf);
+        var conn: Connection = .{ .input = &input, .output = &output, .cipher = pair[0] };
+
+        const rt = try std.Thread.spawn(.{}, Tasks.reader, .{&conn});
+        const wt = try std.Thread.spawn(.{}, Tasks.writer, .{&conn});
+        rt.join();
+        wt.join();
+
+        const state = @atomicLoad(Connection.State, &conn.state, .monotonic);
+        try testing.expect(state == .failed or state == .fatal_alert_pending);
+    }
+}
+
+test "Connection: peer key update request is claimed, answered, and round-trips" {
+    const pair = try testTls13CipherPair();
+    var input: Io.Reader = .fixed(&.{});
+    var out_buf: [1024]u8 = undefined;
+    var output: Io.Writer = .fixed(&out_buf);
+    var conn: Connection = .{ .input = &input, .output = &output, .cipher = pair[0] };
+    var peer = NonBlock.init(pair[1]);
+
+    // As if the read side had processed the peer's update_requested.
+    @atomicStore(bool, &conn.key_update_requested, true, .monotonic);
+    try conn.writeAll("ping");
+    // Claimed before the response was sent, not cleared after it.
+    try testing.expect(!@atomicLoad(bool, &conn.key_update_requested, .monotonic));
+
+    // The peer reads the data through the KeyUpdate response.
+    var cleartext_buf: [64]u8 = undefined;
+    const res = try peer.decrypt(out_buf[0..output.end], &cleartext_buf);
+    try testing.expectEqualStrings("ping", res.cleartext);
 }
