@@ -253,6 +253,7 @@ pub const Handshake = struct {
                 .root_ca = client_auth.root_ca,
                 .host = "",
                 .now_sec = opt.now.toSeconds(),
+                .purpose = .client_auth,
             };
             handshake_state = .certificate;
         }
