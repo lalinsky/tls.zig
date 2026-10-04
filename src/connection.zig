@@ -634,7 +634,7 @@ test "encrypt decrypt" {
     var output_buf: [1024]u8 = undefined;
     // Records are decrypted in place inside the reader's buffer, so the test
     // data has to be writable; `var` makes a mutable copy of it.
-    var input_data = data12.server_pong ** 5;
+    var input_data = data12.server_pong ++ data12.server_pong ++ data12.server_pong ++ data12.server_pong ++ data12.server_pong;
     var stream_reader: Io.Reader = .fixed(&input_data);
     var stream_writer: Io.Writer = .fixed(&output_buf);
     var conn: Connection = .{
@@ -1342,8 +1342,8 @@ test "write with nothing to write" {
 
 test "nonblock key update is included in encryptedLength" {
     const Transcript = @import("transcript.zig").Transcript;
-    const client_secret = [_]u8{1} ** 48;
-    const server_secret = [_]u8{2} ** 48;
+    const client_secret: [48]u8 = @splat(1);
+    const server_secret: [48]u8 = @splat(2);
     const secret: Transcript.Secret = .{
         .client = &client_secret,
         .server = &server_secret,
@@ -1435,8 +1435,8 @@ test "nonblock graceful close is idempotent" {
 /// secrets undefined.
 fn testTls13CipherPair() !struct { Cipher, Cipher } {
     const Transcript = @import("transcript.zig").Transcript;
-    const client_secret = [_]u8{1} ** 48;
-    const server_secret = [_]u8{2} ** 48;
+    const client_secret: [48]u8 = @splat(1);
+    const server_secret: [48]u8 = @splat(2);
     const secret: Transcript.Secret = .{
         .client = &client_secret,
         .server = &server_secret,

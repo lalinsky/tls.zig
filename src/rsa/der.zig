@@ -119,7 +119,7 @@ pub const Parser = struct {
         if (info != .int) @compileError(@typeName(T) ++ " is not an int type");
         const Shift = std.math.Log2Int(u8);
 
-        var result: std.meta.Int(.unsigned, info.int.bits) = 0;
+        var result: @Int(.unsigned, info.int.bits) = 0;
         for (bytes, 0..) |b, index| {
             const shifted = @shlWithOverflow(b, @as(Shift, @intCast(index * 8)));
             if (shifted[1] == 1) return error.Overflow;
@@ -277,7 +277,8 @@ test Element {
         .slice = .{ .start = 2, .end = short_form.len },
     }, Element.init(&short_form, 0));
 
-    const long_form = [_]u8{ 0x30, 129, 129 } ++ [_]u8{0} ** 129;
+    const zeroes: [129]u8 = @splat(0);
+    const long_form = [_]u8{ 0x30, 129, 129 } ++ zeroes;
     try std.testing.expectEqual(Element{
         .identifier = Identifier{ .tag = .sequence, .constructed = true, .class = .universal },
         .slice = .{ .start = 3, .end = long_form.len },

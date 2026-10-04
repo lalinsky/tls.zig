@@ -199,8 +199,8 @@ pub const Alert = enum(u8) {
     /// us. Derived from `Error` rather than from the error name, so it cannot
     /// drift as that set changes.
     pub fn isFromPeer(err: anyerror) bool {
-        inline for (@typeInfo(Error).error_set.?) |e| {
-            if (err == @field(anyerror, e.name)) return true;
+        inline for (comptime std.meta.fieldNames(Error)) |name| {
+            if (err == @field(anyerror, name)) return true;
         }
         return false;
     }
@@ -358,7 +358,8 @@ pub const Side = enum {
     server,
 };
 
-const testing = @import("std").testing;
+const std = @import("std");
+const testing = std.testing;
 
 test "Alert.parse keeps the level" {
     const parsed = Alert.parse(.{
@@ -370,8 +371,8 @@ test "Alert.parse keeps the level" {
 }
 
 test "Alert.isFromPeer covers exactly the alerts we can receive" {
-    inline for (@typeInfo(Alert.Error).error_set.?) |e| {
-        const err = @field(anyerror, e.name);
+    inline for (comptime std.meta.fieldNames(Alert.Error)) |name| {
+        const err = @field(anyerror, name);
         try testing.expect(Alert.isFromPeer(err));
         // An alert the peer sent is its failure to report, not ours.
         try testing.expectEqual(@as(?Alert, null), Alert.forLocalError(err));

@@ -110,7 +110,9 @@ pub const Decoder = struct {
             },
             .@"enum" => |info| {
                 const int = try d.decode(info.tag_type);
-                if (info.is_exhaustive) @compileError("exhaustive enum cannot be used");
+                // Zig 0.17 replaced `is_exhaustive` with `mode`.
+                const exhaustive = if (@hasField(@TypeOf(info), "is_exhaustive")) info.is_exhaustive else info.mode == .exhaustive;
+                if (exhaustive) @compileError("exhaustive enum cannot be used");
                 return @as(T, @enumFromInt(int));
             },
             else => @compileError("unsupported type: " ++ @typeName(T)),
