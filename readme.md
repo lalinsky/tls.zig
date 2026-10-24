@@ -1,5 +1,19 @@
 # tls.zig
 
+> [!NOTE]
+> This is a fork of [ianic/tls.zig](https://github.com/ianic/tls.zig), maintained for
+> [dusty](https://github.com/lalinsky/dusty). It builds with both Zig 0.16 and 0.17, while
+> upstream `main` requires 0.17.
+>
+> The fork follows upstream's `zig-0.16.x` branch, and changes from upstream `main` are
+> cherry-picked onto it. Compared to upstream `main`, it has:
+> - builds with Zig 0.16 and 0.17
+> - RSA signing and decryption through the CRT form of the key (in upstream's `zig-0.16.x`,
+>   open for `main` as [ianic/tls.zig#61](https://github.com/ianic/tls.zig/pull/61))
+> - `Connection.Writer` packs vectored writes into full records, encrypted in place
+>
+> Fixes go upstream first where they apply there.
+
 Zig TLS library, characteristics:
 * TLS 1.2 and TLS 1.3 client
 * TLS 1.3 server
