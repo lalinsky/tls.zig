@@ -147,6 +147,11 @@ pub const Connection = struct {
     /// Encrypts and writes single tls record to the stream.
     fn writeRecord(c: *Self, content_type: proto.ContentType, bytes: []const u8) WriteError!void {
         assert(bytes.len <= cipher.max_cleartext_len);
+        try c.sendKeyUpdate();
+        try c.encryptWrite(content_type, bytes);
+    }
+
+    fn sendKeyUpdate(c: *Self) WriteError!void {
         // If key update is requested send key update message and update
         // my encryption keys.
         if (c.claimKeyUpdate()) {
@@ -166,7 +171,6 @@ pub const Connection = struct {
                 return err;
             };
         }
-        try c.encryptWrite(content_type, bytes);
     }
 
     /// `.failed` is terminal in both directions, so it is a plain atomic
@@ -396,6 +400,68 @@ pub const Connection = struct {
         return n;
     }
 
+    /// Encrypts `header`, then `data` with its last slice repeated `splat`
+    /// times, as the `std.Io.Writer` drain contract has it, and writes as
+    /// much of that as fits in one tls record. The cleartext is gathered
+    /// straight into the record, where it is encrypted in place. Returns the
+    /// number of bytes written, `header` included.
+    pub fn writeSplatHeader(c: *Self, header: []const u8, data: []const []const u8, splat: usize) WriteError!usize {
+        assert(data.len > 0);
+        const total = header.len + Io.Writer.countSplat(data, splat);
+        if (total == 0) return 0;
+        switch (@atomicLoad(State, &c.state, .monotonic)) {
+            .open, .peer_closed => {},
+            else => return error.TlsConnectionFailed,
+        }
+        const encrypt_overhead = c.cipher.encryptOverhead();
+        assert(c.output.buffer.len > encrypt_overhead);
+        const n = @min(total, cipher.max_cleartext_len, c.output.buffer.len - encrypt_overhead);
+
+        // Before the record is gathered, which the key update would overwrite.
+        try c.sendKeyUpdate();
+        const writable = c.output.writableSliceGreedy(c.cipher.recordLen(n)) catch {
+            c.fail();
+            return error.WriteFailed;
+        };
+        const cleartext = writable[c.cipher.cleartextOffset()..][0..n];
+        gather(cleartext, header, data, splat);
+        const rec = c.cipher.encrypt(writable, .application_data, cleartext) catch |err| {
+            c.fail();
+            return err;
+        };
+        c.output.advance(rec.len);
+        c.output.flush() catch {
+            c.fail();
+            return error.WriteFailed;
+        };
+        return n;
+    }
+
+    /// Fills `dest` from the start of `header`, `data` and `splat`.
+    fn gather(dest: []u8, header: []const u8, data: []const []const u8, splat: usize) void {
+        var i = copyPrefix(dest, header);
+        for (data[0 .. data.len - 1]) |bytes| {
+            if (i == dest.len) return;
+            i += copyPrefix(dest[i..], bytes);
+        }
+        const pattern = data[data.len - 1];
+        if (pattern.len == 1) {
+            @memset(dest[i..], pattern[0]);
+            return;
+        }
+        var remaining = splat;
+        while (i < dest.len) : (remaining -= 1) {
+            assert(remaining > 0);
+            i += copyPrefix(dest[i..], pattern);
+        }
+    }
+
+    fn copyPrefix(dest: []u8, src: []const u8) usize {
+        const len = @min(dest.len, src.len);
+        @memcpy(dest[0..len], src[0..len]);
+        return len;
+    }
+
     /// Encrypts cleartext and writes it to the underlying stream. If needed
     /// splits cleartext into multiple tls record.
     pub fn writeAll(c: *Self, bytes: []const u8) WriteError!void {
@@ -570,52 +636,21 @@ pub const Connection = struct {
             };
         }
 
+        /// Records until the buffer is sent, the last taking as much of
+        /// `data` as fits behind it. Leaving none of the buffer behind spares
+        /// `consume` from moving it down after every record.
         fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
             const self: *Writer = @fieldParentPtr("interface", w);
-            // w.buffer is consumed first
-            try self.writeAll(w.buffered());
-            w.end = 0;
-
-            if (data.len == 0) return 0;
-            // Followed by each slice of `data` in order
+            const buffered = w.buffered();
             var n: usize = 0;
-            for (data[0 .. data.len - 1]) |bytes| {
-                try self.writeAll(bytes);
-                n += bytes.len;
+            while (true) {
+                n += self.conn.writeSplatHeader(buffered[n..], data, splat) catch |err| {
+                    self.err = err;
+                    return error.WriteFailed;
+                };
+                if (n >= buffered.len) break;
             }
-
-            // Last element of `data` is repeated as necessary so that it is
-            // written `splat` number of times, which may be zero.
-            const pattern = data[data.len - 1];
-            switch (pattern.len) {
-                0 => {},
-                1 => {
-                    var buffer: [cipher.max_cleartext_len]u8 = undefined;
-                    @memset(&buffer, pattern[0]);
-                    var remaining = splat;
-                    while (remaining > 0) {
-                        const chunk_len = @min(remaining, buffer.len);
-                        try self.writeAll(buffer[0..chunk_len]);
-                        remaining -= chunk_len;
-                    }
-                    n += splat;
-                },
-                else => for (0..splat) |_| {
-                    try self.writeAll(pattern);
-                    n += pattern.len;
-                },
-            }
-
-            // Number of bytes consumed from `data` is returned, excluding bytes
-            // from w.buffer.
-            return n;
-        }
-
-        fn writeAll(self: *Writer, bytes: []const u8) Io.Writer.Error!void {
-            self.conn.writeAll(bytes) catch |err| {
-                self.err = err;
-                return error.WriteFailed;
-            };
+            return w.consume(n);
         }
     };
 
@@ -707,6 +742,95 @@ test "encrypt decrypt" {
         // must not have pulled a record the caller had no room for
         try testing.expectEqualStrings("", conn.cleartext_buf);
     }
+}
+
+test "writer sends one record per drain, packed from every slice" {
+    const client_cipher, const server_cipher = cipher.testCiphers();
+    var output_buf: [72 * 1024]u8 = undefined;
+    var output: Io.Writer = .fixed(&output_buf);
+    var client: Connection = .{ .input = undefined, .output = &output, .cipher = client_cipher };
+
+    var expected: Io.Writer.Allocating = .init(testing.allocator);
+    defer expected.deinit();
+
+    var buffer: [100]u8 = undefined;
+    var writer = client.writer(&buffer);
+    const w = &writer.interface;
+
+    var big: [350]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @truncate(i);
+    var slices: [12][]const u8 = undefined;
+    for (&slices, 0..) |*s, i| s.* = big[0 .. 7 + i * 5];
+
+    try w.writeAll("head");
+    try expected.writer.writeAll("head");
+    try w.writeVecAll(&slices);
+    for (slices) |s| try expected.writer.writeAll(s);
+    try w.splatByteAll('x', 40000);
+    try expected.writer.splatByteAll('x', 40000);
+    // A record boundary in the middle of the pattern.
+    try w.splatBytesAll("abc", 6000);
+    try expected.writer.splatBytesAll("abc", 6000);
+    try w.splatBytesAll("ab", 30);
+    try expected.writer.splatBytesAll("ab", 30);
+    try w.writeAll(&big);
+    try expected.writer.writeAll(&big);
+    try w.writeAll(big[0..30]);
+    try expected.writer.writeAll(big[0..30]);
+    try w.flush();
+    try testing.expectEqual(0, w.end);
+
+    var lens: std.ArrayList(usize) = .empty;
+    defer lens.deinit(testing.allocator);
+    var rest = output.buffered();
+    while (rest.len > 0) {
+        const len = std.mem.readInt(u16, rest[3..5], .big);
+        try lens.append(testing.allocator, len - (client_cipher.encryptOverhead() - record.header_len));
+        rest = rest[record.header_len + len ..];
+    }
+    try testing.expectEqualSlices(usize, &.{ 418, 16384, 16384, 7232, 16384, 1616, 410, 30 }, lens.items);
+
+    var input: Io.Reader = .fixed(output.buffered());
+    var server: Connection = .{ .input = &input, .output = undefined, .cipher = server_cipher };
+    var cleartext: [64 * 1024]u8 = undefined;
+    const n = try server.readAll(&cleartext);
+    try testing.expectEqualSlices(u8, expected.written(), cleartext[0..n]);
+}
+
+test "writer with a buffer larger than a record" {
+    const client_cipher, const server_cipher = cipher.testCiphers();
+    var output_buf: [100 * 1024]u8 = undefined;
+    var output: Io.Writer = .fixed(&output_buf);
+    var client: Connection = .{ .input = undefined, .output = &output, .cipher = client_cipher };
+
+    var expected: [90000]u8 = undefined;
+    for (&expected, 0..) |*b, i| b.* = @truncate(i *% 7);
+
+    var buffer: [40000]u8 = undefined;
+    var writer = client.writer(&buffer);
+    const w = &writer.interface;
+    try w.writeAll(expected[0..40000]);
+    try w.flush();
+    try w.writeAll(expected[40000..60000]);
+    // Sends the buffer, then buffers what is left of this.
+    try w.writeAll(expected[60000..]);
+    try w.flush();
+
+    var lens: std.ArrayList(usize) = .empty;
+    defer lens.deinit(testing.allocator);
+    var rest = output.buffered();
+    while (rest.len > 0) {
+        const len = std.mem.readInt(u16, rest[3..5], .big);
+        try lens.append(testing.allocator, len - (client_cipher.encryptOverhead() - record.header_len));
+        rest = rest[record.header_len + len ..];
+    }
+    try testing.expectEqualSlices(usize, &.{ 16384, 16384, 7232, 16384, 16384, 16384, 848 }, lens.items);
+
+    var input: Io.Reader = .fixed(output.buffered());
+    var server: Connection = .{ .input = &input, .output = undefined, .cipher = server_cipher };
+    var cleartext: [expected.len]u8 = undefined;
+    try testing.expectEqual(expected.len, try server.readAll(&cleartext));
+    try testing.expectEqualSlices(u8, &expected, &cleartext);
 }
 
 // Copied from: https://github.com/ziglang/zig/blob/455899668b620dfda40252501c748c0a983555bd/lib/std/crypto/tls/Client.zig#L1354

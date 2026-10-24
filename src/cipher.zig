@@ -195,6 +195,14 @@ pub const Cipher = union(CipherSuite) {
         };
     }
 
+    /// Where `encrypt` puts the cleartext in the record it builds. Cleartext
+    /// already there is encrypted in place.
+    pub fn cleartextOffset(c: Cipher) usize {
+        return switch (c) {
+            inline else => |f| return @TypeOf(f).cleartext_offset,
+        };
+    }
+
     pub fn encryptOverhead(c: Cipher) usize {
         return switch (c) {
             inline else => |f| return @TypeOf(f).encrypt_overhead,
@@ -239,6 +247,7 @@ fn Aead12Type(comptime AeadType: type) type {
         const nonce_len = AeadType.nonce_length;
         const iv_len = AeadType.nonce_length - explicit_iv_len;
         const encrypt_overhead = record.header_len + explicit_iv_len + auth_tag_len;
+        const cleartext_offset = record.header_len + explicit_iv_len;
 
         encrypt_key: [key_len]u8,
         decrypt_key: [key_len]u8,
@@ -335,6 +344,7 @@ fn Aead12ChaChaType(comptime AeadType: type) type {
         const auth_tag_len = AeadType.tag_length;
         const nonce_len = AeadType.nonce_length;
         const encrypt_overhead = record.header_len + auth_tag_len;
+        const cleartext_offset = record.header_len;
 
         encrypt_key: [key_len]u8,
         decrypt_key: [key_len]u8,
@@ -428,6 +438,7 @@ fn Aead13Type(comptime AeadType: type, comptime Hash: type) type {
         const nonce_len = AeadType.nonce_length;
         const digest_len = Hash.digest_length;
         const encrypt_overhead = record.header_len + 1 + auth_tag_len;
+        const cleartext_offset = record.header_len;
 
         encrypt_secret: [digest_len]u8,
         decrypt_secret: [digest_len]u8,
@@ -559,6 +570,7 @@ fn CbcType(comptime BlockCipher: type, comptime HashType: type) type {
         const key_len = BlockCipher.key_bits / 8; // 16, 32 for Aes128, Aes256
         const iv_len = 16;
         const encrypt_overhead = record.header_len + iv_len + mac_len + max_padding;
+        const cleartext_offset = record.header_len + iv_len;
 
         const Hmac = crypto.auth.hmac.Hmac(HashType);
         const paddedLength = CBC.paddedLength;
@@ -610,8 +622,11 @@ fn CbcType(comptime BlockCipher: type, comptime HashType: type) type {
             cleartext: []const u8,
         ) ![]const u8 {
             if (buf.len < self.recordLen(cleartext.len)) return error.TlsCipherNoSpaceLeft;
-            const cleartext_idx = record.header_len + iv_len; // position of cleartext in buf
-            @memcpy(buf[cleartext_idx..][0..cleartext.len], cleartext);
+            const cleartext_idx = cleartext_offset; // position of cleartext in buf
+            // Skip @memcpy if cleartext is already part of the buf at right position
+            if (cleartext.ptr != buf[cleartext_idx..].ptr) {
+                @memcpy(buf[cleartext_idx..][0..cleartext.len], cleartext);
+            }
 
             { // calculate mac from (ad + cleartext)
                 // ...     | ad | cleartext | mac | ...
@@ -1050,6 +1065,15 @@ fn encryptDecrypt(client_cipher: *Cipher, server_cipher: *Cipher) !void {
     {
         const encrypted = try server_cipher.encrypt(&buf, .application_data, cleartext);
         const content_type, const decrypted = try client_cipher.decrypt(&buf, Record.init(encrypted));
+        try testing.expectEqualSlices(u8, cleartext, decrypted);
+        try testing.expectEqual(.application_data, content_type);
+    }
+    { // cleartext already in place
+        const in_place = buf[client_cipher.cleartextOffset()..][0..cleartext.len];
+        @memcpy(in_place, cleartext);
+        const encrypted = try client_cipher.encrypt(&buf, .application_data, in_place);
+        try testing.expectEqual(client_cipher.recordLen(cleartext.len), encrypted.len);
+        const content_type, const decrypted = try server_cipher.decrypt(&buf, Record.init(encrypted));
         try testing.expectEqualSlices(u8, cleartext, decrypted);
         try testing.expectEqual(.application_data, content_type);
     }
