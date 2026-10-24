@@ -636,14 +636,20 @@ pub const Connection = struct {
             };
         }
 
-        /// One record per call: whatever is buffered, then as much of `data`
-        /// as fits behind it.
+        /// Records until the buffer is sent, the last taking as much of
+        /// `data` as fits behind it. Leaving none of the buffer behind spares
+        /// `consume` from moving it down after every record.
         fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
             const self: *Writer = @fieldParentPtr("interface", w);
-            const n = self.conn.writeSplatHeader(w.buffered(), data, splat) catch |err| {
-                self.err = err;
-                return error.WriteFailed;
-            };
+            const buffered = w.buffered();
+            var n: usize = 0;
+            while (true) {
+                n += self.conn.writeSplatHeader(buffered[n..], data, splat) catch |err| {
+                    self.err = err;
+                    return error.WriteFailed;
+                };
+                if (n >= buffered.len) break;
+            }
             return w.consume(n);
         }
     };
@@ -789,6 +795,42 @@ test "writer sends one record per drain, packed from every slice" {
     var cleartext: [64 * 1024]u8 = undefined;
     const n = try server.readAll(&cleartext);
     try testing.expectEqualSlices(u8, expected.written(), cleartext[0..n]);
+}
+
+test "writer with a buffer larger than a record" {
+    const client_cipher, const server_cipher = cipher.testCiphers();
+    var output_buf: [100 * 1024]u8 = undefined;
+    var output: Io.Writer = .fixed(&output_buf);
+    var client: Connection = .{ .input = undefined, .output = &output, .cipher = client_cipher };
+
+    var expected: [90000]u8 = undefined;
+    for (&expected, 0..) |*b, i| b.* = @truncate(i *% 7);
+
+    var buffer: [40000]u8 = undefined;
+    var writer = client.writer(&buffer);
+    const w = &writer.interface;
+    try w.writeAll(expected[0..40000]);
+    try w.flush();
+    try w.writeAll(expected[40000..60000]);
+    // Sends the buffer, then buffers what is left of this.
+    try w.writeAll(expected[60000..]);
+    try w.flush();
+
+    var lens: std.ArrayList(usize) = .empty;
+    defer lens.deinit(testing.allocator);
+    var rest = output.buffered();
+    while (rest.len > 0) {
+        const len = std.mem.readInt(u16, rest[3..5], .big);
+        try lens.append(testing.allocator, len - (client_cipher.encryptOverhead() - record.header_len));
+        rest = rest[record.header_len + len ..];
+    }
+    try testing.expectEqualSlices(usize, &.{ 16384, 16384, 7232, 16384, 16384, 16384, 848 }, lens.items);
+
+    var input: Io.Reader = .fixed(output.buffered());
+    var server: Connection = .{ .input = &input, .output = undefined, .cipher = server_cipher };
+    var cleartext: [expected.len]u8 = undefined;
+    try testing.expectEqual(expected.len, try server.readAll(&cleartext));
+    try testing.expectEqualSlices(u8, &expected, &cleartext);
 }
 
 // Copied from: https://github.com/ziglang/zig/blob/455899668b620dfda40252501c748c0a983555bd/lib/std/crypto/tls/Client.zig#L1354
