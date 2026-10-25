@@ -585,12 +585,49 @@ pub const Connection = struct {
                 .interface = .{
                     .vtable = &.{
                         .stream = stream,
+                        .readVec = readVec,
                     },
                     .buffer = buffer,
                     .seek = 0,
                     .end = 0,
                 },
             };
+        }
+
+        /// What one record holds, into `data` and then the buffer. Through
+        /// `writableVector`, as a socket reader does, so a buffer with
+        /// nothing left in it is filled from the start: room for a whole
+        /// record means it is decrypted straight into place.
+        fn readVec(r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+            const self: *Reader = @fieldParentPtr("interface", r);
+            var dest_buffer: [8][]u8 = undefined;
+            const dest_n, var data_size = try r.writableVector(&dest_buffer, data);
+            var dests = dest_buffer[0..dest_n];
+            // Slices shorter than the buffer would have a whole record
+            // decrypted aside and copied out of; the buffer takes it as is.
+            if (data_size > 0 and data_size < r.buffer.len and dests[dest_n - 1].ptr == r.buffer.ptr) {
+                dests = dests[dest_n - 1 ..];
+                data_size = 0;
+            }
+            var n: usize = 0;
+            for (dests) |dest| {
+                if (dest.len == 0) continue;
+                // Only what is already decrypted: another record could block.
+                if (n > 0 and self.conn.cleartext_buf.len == 0) break;
+                const len = self.conn.read(dest) catch |err| {
+                    self.err = err;
+                    return error.ReadFailed;
+                };
+                if (len == 0) break;
+                n += len;
+                if (len < dest.len) break;
+            }
+            if (n == 0) return error.EndOfStream;
+            if (n > data_size) {
+                r.end += n - data_size;
+                return data_size;
+            }
+            return n;
         }
 
         fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
@@ -831,6 +868,46 @@ test "writer with a buffer larger than a record" {
     var cleartext: [expected.len]u8 = undefined;
     try testing.expectEqual(expected.len, try server.readAll(&cleartext));
     try testing.expectEqualSlices(u8, &expected, &cleartext);
+}
+
+test "reader refills an emptied buffer from the start" {
+    const client_cipher, const server_cipher = cipher.testCiphers();
+    var plain: [4 * cipher.max_cleartext_len]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = @truncate(i *% 13);
+
+    var ciphertext_buf: [plain.len + 1024]u8 = undefined;
+    var ciphertext: Io.Writer = .fixed(&ciphertext_buf);
+    var client: Connection = .{ .input = undefined, .output = &ciphertext, .cipher = client_cipher };
+    try client.writeAll(&plain);
+
+    var input: Io.Reader = .fixed(ciphertext.buffered());
+    var server: Connection = .{ .input = &input, .output = undefined, .cipher = server_cipher };
+    var buffer: [cipher.max_cleartext_len + 1024]u8 = undefined;
+    var reader = server.reader(&buffer);
+    const r = &reader.interface;
+
+    // The first record, consumed to near the end of the buffer.
+    try testing.expectEqualSlices(u8, plain[0..10000], try r.take(10000));
+    try testing.expectEqualSlices(u8, plain[10000..cipher.max_cleartext_len], try r.take(cipher.max_cleartext_len - 10000));
+    // The next one goes to the start, decrypted there whole.
+    try r.fillMore();
+    try testing.expectEqual(0, r.seek);
+    try testing.expectEqual(cipher.max_cleartext_len, r.end);
+    try testing.expectEqual(0, server.cleartext_buf.len);
+    try testing.expectEqualSlices(u8, plain[cipher.max_cleartext_len..][0..cipher.max_cleartext_len], try r.take(cipher.max_cleartext_len));
+
+    // A slice too short for a record: the record goes to the buffer whole.
+    var small: [2]u8 = undefined;
+    try r.readSliceAll(&small);
+    try testing.expectEqualSlices(u8, plain[2 * cipher.max_cleartext_len ..][0..2], &small);
+    try testing.expectEqual(2, r.seek);
+    try testing.expectEqual(cipher.max_cleartext_len, r.end);
+
+    // Long enough for a record: straight into the caller's slice.
+    var rest: [plain.len - 2 * cipher.max_cleartext_len - 2]u8 = undefined;
+    try r.readSliceAll(&rest);
+    try testing.expectEqualSlices(u8, plain[2 * cipher.max_cleartext_len + 2 ..], &rest);
+    try testing.expectError(error.EndOfStream, r.takeByte());
 }
 
 // Copied from: https://github.com/ziglang/zig/blob/455899668b620dfda40252501c748c0a983555bd/lib/std/crypto/tls/Client.zig#L1354
