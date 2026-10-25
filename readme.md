@@ -11,6 +11,10 @@
 > - RSA signing and decryption through the CRT form of the key (in upstream's `zig-0.16.x`,
 >   open for `main` as [ianic/tls.zig#61](https://github.com/ianic/tls.zig/pull/61))
 > - `Connection.Writer` packs vectored writes into full records, encrypted in place
+> - `Connection.inPlaceWriter()`, a writer whose buffer is the next record's payload in the
+>   output buffer, so what is written is copied once
+> - `Connection.Reader` refills an emptied buffer from the start, so a full record is
+>   decrypted straight into it
 >
 > Fixes go upstream first where they apply there.
 
