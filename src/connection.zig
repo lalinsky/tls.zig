@@ -437,6 +437,60 @@ pub const Connection = struct {
         return n;
     }
 
+    const key_update_msg = record.handshakeHeader(.key_update, 1) ++ [_]u8{0};
+
+    /// Most of what follows a window's first `len` bytes that sealing them
+    /// can overwrite: a key update moved in ahead of them, and the record's
+    /// trailer.
+    const max_seal_spill = 2 * @max(cipher.encrypt_overhead_tls_12, cipher.encrypt_overhead_tls_13) + key_update_msg.len;
+
+    /// Where an in-place writer gathers the next record's cleartext: its
+    /// payload in `output`, with room kept ahead of it for a key update.
+    fn payloadWindow(c: *Self) []u8 {
+        const unused = c.output.unusedCapacitySlice();
+        const reserved = c.cipher.encryptOverhead() + c.cipher.recordLen(key_update_msg.len);
+        if (unused.len <= reserved) return unused[0..0];
+        return unused[c.cipher.cleartextOffset()..][0..@min(cipher.max_cleartext_len, unused.len - reserved)];
+    }
+
+    /// Encrypts the first `len` bytes of `payloadWindow()` where they are, as
+    /// one record, and sends it. A key update that is due goes out first,
+    /// in the same write, with the cleartext moved up to make room for it.
+    fn sealWindow(c: *Self, len: usize) WriteError!void {
+        if (len == 0) return;
+        switch (@atomicLoad(State, &c.state, .monotonic)) {
+            .open, .peer_closed => {},
+            else => return error.TlsConnectionFailed,
+        }
+        const buf = c.output.unusedCapacitySlice();
+        const offset = c.cipher.cleartextOffset();
+        var at: usize = 0;
+        if (c.claimKeyUpdate()) {
+            const update_len = c.cipher.recordLen(key_update_msg.len);
+            std.mem.copyBackwards(u8, buf[update_len + offset ..][0..len], buf[offset..][0..len]);
+            // rfc: https://datatracker.ietf.org/doc/html/rfc8446#autoid-57
+            const rec = c.cipher.encrypt(buf, .handshake, &key_update_msg) catch |err| {
+                c.fail();
+                return err;
+            };
+            assert(rec.len == update_len);
+            c.cipher.keyUpdateEncrypt() catch |err| {
+                c.fail();
+                return err;
+            };
+            at = update_len;
+        }
+        const rec = c.cipher.encrypt(buf[at..], .application_data, buf[at + offset ..][0..len]) catch |err| {
+            c.fail();
+            return err;
+        };
+        c.output.advance(at + rec.len);
+        c.output.flush() catch {
+            c.fail();
+            return error.WriteFailed;
+        };
+    }
+
     /// Fills `dest` from the start of `header`, `data` and `splat`.
     fn gather(dest: []u8, header: []const u8, data: []const []const u8, splat: usize) void {
         var i = copyPrefix(dest, header);
@@ -689,10 +743,88 @@ pub const Connection = struct {
             }
             return w.consume(n);
         }
+
+        /// Writing into the window `inPlaceWriter` hands out.
+        fn initInPlace(c: *Connection) Writer {
+            return .{
+                .conn = c,
+                .interface = .{
+                    .vtable = &.{
+                        .drain = drainInPlace,
+                        .rebase = rebaseInPlace,
+                    },
+                    .buffer = c.payloadWindow(),
+                    .end = 0,
+                },
+            };
+        }
+
+        /// What is buffered is already in place: as much of `data` as fits
+        /// joins it, and the window goes out as one record.
+        fn drainInPlace(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            const self: *Writer = @fieldParentPtr("interface", w);
+            const total = Io.Writer.countSplat(data, splat);
+            if (w.buffer.len == 0 and total > 0) return self.fail(error.TlsCipherNoSpaceLeft);
+            const n = @min(w.buffer.len - w.end, total);
+            Connection.gather(w.buffer[w.end..][0..n], "", data, splat);
+            try self.seal(w.end + n);
+            return n;
+        }
+
+        /// The default rebase moves the preserved bytes after a drain, from
+        /// where sealing the record ahead of them has already written over
+        /// their start.
+        fn rebaseInPlace(w: *Io.Writer, preserve: usize, minimum_len: usize) Io.Writer.Error!void {
+            const self: *Writer = @fieldParentPtr("interface", w);
+            while (w.buffer.len - w.end < minimum_len) {
+                const keep = @min(preserve, w.end);
+                const head = w.end - keep;
+                if (head == 0) return self.fail(error.TlsCipherNoSpaceLeft);
+                const tail = w.buffer[head..w.end];
+                var spill: [max_seal_spill]u8 = undefined;
+                const saved = @min(keep, spill.len);
+                @memcpy(spill[0..saved], tail[0..saved]);
+                try self.seal(head);
+                if (w.buffer.len < keep) {
+                    // The preserved bytes have nowhere to go, and the stream
+                    // cannot go on without them.
+                    self.conn.fail();
+                    return self.fail(error.TlsCipherNoSpaceLeft);
+                }
+                @memmove(w.buffer[saved..keep], tail[saved..]);
+                @memcpy(w.buffer[0..saved], spill[0..saved]);
+                w.end = keep;
+            }
+        }
+
+        /// Sends the first `len` bytes of the window and takes the next one.
+        fn seal(self: *Writer, len: usize) Io.Writer.Error!void {
+            self.conn.sealWindow(len) catch |err| return self.fail(err);
+            self.interface.buffer = self.conn.payloadWindow();
+            self.interface.end = 0;
+        }
+
+        fn fail(self: *Writer, err: Error) Io.Writer.Error {
+            self.err = err;
+            return error.WriteFailed;
+        }
     };
 
     pub fn writer(c: *Self, buffer: []u8) Writer {
         return .init(c, buffer);
+    }
+
+    /// A writer whose buffer is the next record's payload in `output`, so
+    /// what is written is copied once, to where it is encrypted in place.
+    ///
+    /// Once it is in use, nothing else may write to `output`, but for a
+    /// `close` after it is flushed for the last time. `output` has to have
+    /// room for a whole record after every flush, as a socket's writer does;
+    /// one that makes room by growing is not supported. The writer's buffer
+    /// moves with each record and must not be replaced. One per connection.
+    pub fn inPlaceWriter(c: *Self) Writer {
+        assert(c.output.buffer.len > c.cipher.encryptOverhead() + c.cipher.recordLen(key_update_msg.len));
+        return .initInPlace(c);
     }
 };
 
@@ -908,6 +1040,100 @@ test "reader refills an emptied buffer from the start" {
     try r.readSliceAll(&rest);
     try testing.expectEqualSlices(u8, plain[2 * cipher.max_cleartext_len + 2 ..], &rest);
     try testing.expectError(error.EndOfStream, r.takeByte());
+}
+
+/// Stands in for a socket's writer: sends what it holds on every drain,
+/// so the next record starts at the front of the buffer again.
+const TestSink = struct {
+    sent: std.ArrayList(u8) = .empty,
+    interface: Io.Writer,
+
+    fn init(buffer: []u8) TestSink {
+        return .{ .interface = .{ .buffer = buffer, .vtable = &.{ .drain = drain } } };
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *TestSink = @fieldParentPtr("interface", w);
+        self.sent.appendSlice(testing.allocator, w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        for (data[0 .. data.len - 1]) |bytes| self.sent.appendSlice(testing.allocator, bytes) catch return error.WriteFailed;
+        for (0..splat) |_| self.sent.appendSlice(testing.allocator, data[data.len - 1]) catch return error.WriteFailed;
+        return Io.Writer.countSplat(data, splat);
+    }
+};
+
+/// Writes through an in-place writer what `expected` records, with a key
+/// update falling due while bytes are buffered and a rebase that keeps
+/// some of them.
+fn writeInPlace(client: *Connection, expected: *Io.Writer) !void {
+    var writer = client.inPlaceWriter();
+    const w = &writer.interface;
+    var big: [16000]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var slices: [12][]const u8 = undefined;
+    for (&slices, 0..) |*s, i| s.* = big[0 .. 7 + i * 5];
+
+    inline for (.{ w, expected }) |out| {
+        try out.print("{s}-{d}\n", .{ "head", 42 });
+        try out.writeVecAll(&slices);
+        try out.splatByteAll('x', 40000);
+        try out.writeAll("buffered when the key update falls due");
+    }
+    client.key_update_requested = true;
+    inline for (.{ w, expected }) |out| {
+        try out.splatBytesAll("abc", 6000);
+        try out.writeAll(&big);
+    }
+    try testing.expect(!client.key_update_requested);
+    // Sealing what comes before the preserved bytes, with a key update
+    // moving it up, writes over the start of them.
+    try w.flush();
+    try w.writeAll(big[0..15000]);
+    try expected.writeAll(big[0..15000]);
+    client.key_update_requested = true;
+    const room = try w.writableSliceGreedyPreserve(100, 2000);
+    try testing.expectEqual(100, w.end);
+    try testing.expect(!client.key_update_requested);
+    for (room[0..2000], 0..) |*b, i| b.* = @truncate(i);
+    w.advance(2000);
+    for (0..2000) |i| try expected.writeByte(@truncate(i));
+    try w.flush();
+    try testing.expectEqual(0, w.end);
+}
+
+fn expectDecrypts(server_cipher: Cipher, ciphertext: []const u8, expected: []const u8) !void {
+    var input: Io.Reader = .fixed(ciphertext);
+    var server: Connection = .{ .input = &input, .output = undefined, .cipher = server_cipher };
+    const cleartext = try testing.allocator.alloc(u8, expected.len + 1);
+    defer testing.allocator.free(cleartext);
+    const n = try server.readAll(cleartext);
+    try testing.expectEqualSlices(u8, expected, cleartext[0..n]);
+}
+
+test "in-place writer, with a transport that empties on flush" {
+    const client_cipher, const server_cipher = cipher.testCiphers();
+    var output_buf: [@import("root.zig").output_buffer_len]u8 = undefined;
+    var sink: TestSink = .init(&output_buf);
+    defer sink.sent.deinit(testing.allocator);
+    var client: Connection = .{ .input = undefined, .output = &sink.interface, .cipher = client_cipher };
+
+    var expected: Io.Writer.Allocating = .init(testing.allocator);
+    defer expected.deinit();
+    try writeInPlace(&client, &expected.writer);
+    try expectDecrypts(server_cipher, sink.sent.items, expected.written());
+}
+
+test "in-place writer, with a transport that keeps what it is given" {
+    const client_cipher, const server_cipher = cipher.testCiphers();
+    const output_buf = try testing.allocator.alloc(u8, 128 * 1024);
+    defer testing.allocator.free(output_buf);
+    var output: Io.Writer = .fixed(output_buf);
+    var client: Connection = .{ .input = undefined, .output = &output, .cipher = client_cipher };
+
+    var expected: Io.Writer.Allocating = .init(testing.allocator);
+    defer expected.deinit();
+    try writeInPlace(&client, &expected.writer);
+    try expectDecrypts(server_cipher, output.buffered(), expected.written());
 }
 
 // Copied from: https://github.com/ziglang/zig/blob/455899668b620dfda40252501c748c0a983555bd/lib/std/crypto/tls/Client.zig#L1354
