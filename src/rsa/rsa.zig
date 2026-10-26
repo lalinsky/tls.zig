@@ -181,21 +181,22 @@ pub const Crt = struct {
     /// `qInv = q^-1 mod p`.
     q_inv: PrimeModulus.Fe,
     /// The same key for `mont`, which does the work in a fraction of the
-    /// time `ff` takes. Its sizes cover the primes of every key from 1024 to
-    /// 4096 bits; any other key stays with `ff`.
+    /// time `ff` takes. Its sizes cover the primes of keys from 2048 to 4096
+    /// bits; any other key stays with `ff`.
     fast: Fast = .none,
 
     const Fast = union(enum) {
         none,
-        @"8": mont.Crt(8),
         @"16": mont.Crt(16),
         @"24": mont.Crt(24),
         @"32": mont.Crt(32),
 
         fn init(p: []const u8, q: []const u8, q_inv: []const u8) Fast {
             const len = @max(significantLen(p), significantLen(q));
-            inline for (.{ 8, 16, 24, 32 }) |n| {
-                if (len <= n * 8) {
+            inline for (.{ 16, 24, 32 }) |n| {
+                // Primes of 512 bits and below, of keys too weak to use,
+                // stay with `ff` rather than cost the code for another size.
+                if (len <= n * 8 and len > (n - 8) * 8) {
                     const crt = mont.Crt(n).init(p, q, q_inv) catch return .none;
                     return @unionInit(Fast, std.fmt.comptimePrint("{d}", .{n}), crt);
                 }
@@ -1101,7 +1102,7 @@ test "rsa CRT signature matches the one made with d alone" {
 test "rsa CRT by way of mont agrees with ff, at every size" {
     if (skip_slow_tests) return error.SkipZigTest;
     const keys = .{
-        .{ @embedFile("testdata/rsa_1024.der"), .@"8" },
+        .{ @embedFile("testdata/rsa_1024.der"), .none },
         .{ @embedFile("testdata/rsa_2050.der"), .@"24" },
         .{ @embedFile("testdata/rsa_3072.der"), .@"24" },
         .{ @embedFile("testdata/rsa_4096.der"), .@"32" },

@@ -22,6 +22,11 @@ pub fn Modulus(comptime n: usize) type {
         /// Bits of exponent taken per multiplication.
         const window = 5;
 
+        /// Whether `mul` and `sqr` are unrolled completely. That is the
+        /// fastest by about a fifth, but costs code quadratic in `n`, so
+        /// it is kept to 2048-bit keys and below; larger ones loop over rows.
+        const unroll = n <= 16;
+
         /// Little-endian limbs of the modulus.
         m: Int,
         /// `-m^-1 mod 2^64`.
@@ -49,8 +54,7 @@ pub fn Modulus(comptime n: usize) type {
             x[0] = 1;
             for (0..2 * 64 * n) |k| {
                 if (k == 64 * n) self.one = x;
-                const carry = shl1(&x);
-                self.reduceOnce(&x, carry);
+                doubleMod(&x, &m);
             }
             self.rr = x;
             return self;
@@ -145,52 +149,63 @@ pub fn Modulus(comptime n: usize) type {
 
         /// Montgomery multiplication, `a * b / R mod m`, for `a, b < m`
         /// (coarsely integrated operand scanning).
-        pub fn mul(self: *const Self, a: Int, b: Int) Int {
+        pub noinline fn mul(self: *const Self, a: Int, b: Int) Int {
             @setEvalBranchQuota(16 * n * n);
             var t: [n + 2]Limb = @splat(0);
-            inline for (0..n) |i| {
-                var c: Limb = 0;
-                inline for (0..n) |j| {
-                    const p = @as(DLimb, a[j]) * b[i] + t[j] + c;
-                    t[j] = @truncate(p);
-                    c = @truncate(p >> 64);
-                }
-                const s = @as(DLimb, t[n]) + c;
-                t[n] = @truncate(s);
-                t[n + 1] = @truncate(s >> 64);
-
-                const q = t[0] *% self.m0inv;
-                var p = @as(DLimb, q) * self.m[0] + t[0];
-                c = @truncate(p >> 64);
-                inline for (1..n) |j| {
-                    p = @as(DLimb, q) * self.m[j] + t[j] + c;
-                    t[j - 1] = @truncate(p);
-                    c = @truncate(p >> 64);
-                }
-                const s2 = @as(DLimb, t[n]) + c;
-                t[n - 1] = @truncate(s2);
-                t[n] = t[n + 1] + @as(Limb, @truncate(s2 >> 64));
+            if (unroll) {
+                inline for (0..n) |i| self.mulRow(&t, a, b[i]);
+            } else {
+                for (0..n) |i| self.mulRow(&t, a, b[i]);
             }
             var r: Int = t[0..n].*;
             self.reduceOnce(&r, t[n]);
             return r;
         }
 
+        /// One step of `mul`: `t = (t + a * bi + q * m) / 2^64`.
+        inline fn mulRow(self: *const Self, t: *[n + 2]Limb, a: Int, bi: Limb) void {
+            var c: Limb = 0;
+            inline for (0..n) |j| {
+                const p = @as(DLimb, a[j]) * bi + t[j] + c;
+                t[j] = @truncate(p);
+                c = @truncate(p >> 64);
+            }
+            const s = @as(DLimb, t[n]) + c;
+            t[n] = @truncate(s);
+            t[n + 1] = @truncate(s >> 64);
+
+            const q = t[0] *% self.m0inv;
+            var p = @as(DLimb, q) * self.m[0] + t[0];
+            c = @truncate(p >> 64);
+            inline for (1..n) |j| {
+                p = @as(DLimb, q) * self.m[j] + t[j] + c;
+                t[j - 1] = @truncate(p);
+                c = @truncate(p >> 64);
+            }
+            const s2 = @as(DLimb, t[n]) + c;
+            t[n - 1] = @truncate(s2);
+            t[n] = t[n + 1] + @as(Limb, @truncate(s2 >> 64));
+        }
+
         /// `a * a / R mod m`: the cross products are computed once and
         /// doubled, then the double-width square is reduced.
-        pub fn sqr(self: *const Self, a: Int) Int {
+        pub noinline fn sqr(self: *const Self, a: Int) Int {
             @setEvalBranchQuota(16 * n * n);
             var t: [2 * n + 1]Limb = @splat(0);
 
             // Cross products a[i] * a[j] for i < j.
-            inline for (0..n - 1) |i| {
-                var c: Limb = 0;
-                inline for (i + 1..n) |j| {
-                    const p = @as(DLimb, a[i]) * a[j] + t[i + j] + c;
-                    t[i + j] = @truncate(p);
-                    c = @truncate(p >> 64);
+            if (unroll) {
+                inline for (0..n - 1) |i| {
+                    var c: Limb = 0;
+                    inline for (i + 1..n) |j| mulAdd(&t[i + j], a[i], a[j], &c);
+                    t[i + n] = c;
                 }
-                t[i + n] = c;
+            } else {
+                for (0..n - 1) |i| {
+                    var c: Limb = 0;
+                    for (i + 1..n) |j| mulAdd(&t[i + j], a[i], a[j], &c);
+                    t[i + n] = c;
+                }
             }
 
             // Doubled, plus the squares on the diagonal.
@@ -212,21 +227,25 @@ pub fn Modulus(comptime n: usize) type {
 
             // Montgomery reduction of the 2n-limb square, one limb at a time.
             var hi: Limb = 0;
-            inline for (0..n) |i| {
-                const q = t[i] *% self.m0inv;
-                var cc: Limb = 0;
-                inline for (0..n) |j| {
-                    const p = @as(DLimb, q) * self.m[j] + t[i + j] + cc;
-                    t[i + j] = @truncate(p);
-                    cc = @truncate(p >> 64);
-                }
-                const s = @as(DLimb, t[i + n]) + cc + hi;
-                t[i + n] = @truncate(s);
-                hi = @truncate(s >> 64);
+            if (unroll) {
+                inline for (0..n) |i| self.reduceRow(t[i..][0 .. n + 1], &hi);
+            } else {
+                for (0..n) |i| self.reduceRow(t[i..][0 .. n + 1], &hi);
             }
             var r: Int = t[n .. 2 * n].*;
             self.reduceOnce(&r, hi);
             return r;
+        }
+
+        /// One step of the reduction in `sqr`: adds `q * m`, which clears
+        /// `row[0]`, and carries out through `hi`.
+        inline fn reduceRow(self: *const Self, row: *[n + 1]Limb, hi: *Limb) void {
+            const q = row[0] *% self.m0inv;
+            var c: Limb = 0;
+            inline for (0..n) |j| mulAdd(&row[j], q, self.m[j], &c);
+            const s = @as(DLimb, row[n]) + c + hi.*;
+            row[n] = @truncate(s);
+            hi.* = @truncate(s >> 64);
         }
 
         /// `x - m` in place when the value `carry * 2^(64n) + x` is at least
@@ -253,14 +272,25 @@ pub fn Modulus(comptime n: usize) type {
             limbsToBytes(n, x, out);
         }
 
-        fn shl1(x: *Int) Limb {
+        /// `x = 2x mod m`, for `x < m`. Setup only, so the loops are left
+        /// rolled; still constant time.
+        fn doubleMod(x: *Int, m: *const Int) void {
             var top: Limb = 0;
-            inline for (0..n) |i| {
-                const v = x[i];
-                x[i] = (v << 1) | top;
-                top = v >> 63;
+            for (x) |*v| {
+                const w = v.*;
+                v.* = (w << 1) | top;
+                top = w >> 63;
             }
-            return top;
+            var d: Int = undefined;
+            var borrow: Limb = 0;
+            for (x, m, &d) |xv, mv, *dv| {
+                const s1 = @subWithOverflow(xv, mv);
+                const s2 = @subWithOverflow(s1[0], borrow);
+                dv.* = s2[0];
+                borrow = s1[1] | s2[1];
+            }
+            const keep = 0 -% (borrow & ~top & 1);
+            for (x, d) |*xv, dv| xv.* = (xv.* & keep) | (dv & ~keep);
         }
 
         fn isZero(x: anytype) bool {
@@ -305,7 +335,7 @@ pub fn Crt(comptime n: usize) type {
         /// `x^d mod pq`, from `dP = d mod (p - 1)` and `dQ = d mod (q - 1)`.
         /// `x` and `out` are big-endian, and may be the same buffer; `out`
         /// must be long enough for `pq`.
-        pub fn pow(self: *const Self, x: []const u8, dp: []const u8, dq: []const u8, out: []u8) error{Overflow}!void {
+        pub noinline fn pow(self: *const Self, x: []const u8, dp: []const u8, dq: []const u8, out: []u8) error{Overflow}!void {
             const xw = try limbsFromBytes(2 * n, x);
             const m1 = self.p.powMont(self.p.reduceWide(xw), dp);
             const m2 = self.q.fromMont(self.q.powMont(self.q.reduceWide(xw), dq));
@@ -317,7 +347,7 @@ pub fn Crt(comptime n: usize) type {
             // m = m2 + q * h, below pq.
             var r = mulWide(n, self.q.m, h);
             var carry: Limb = 0;
-            inline for (0..2 * n) |i| {
+            for (0..2 * n) |i| {
                 const s1 = @addWithOverflow(r[i], if (i < n) m2[i] else 0);
                 const s2 = @addWithOverflow(s1[0], carry);
                 r[i] = s2[0];
@@ -333,11 +363,7 @@ fn mulWide(comptime n: usize, a: [n]Limb, b: [n]Limb) [2 * n]Limb {
     var r: [2 * n]Limb = @splat(0);
     for (0..n) |i| {
         var c: Limb = 0;
-        inline for (0..n) |j| {
-            const p = @as(DLimb, a[j]) * b[i] + r[i + j] + c;
-            r[i + j] = @truncate(p);
-            c = @truncate(p >> 64);
-        }
+        for (0..n) |j| mulAdd(&r[i + j], a[j], b[i], &c);
         r[i + n] = c;
     }
     return r;
@@ -352,20 +378,27 @@ fn limbsFromBytes(comptime k: usize, be: []const u8) error{Overflow}![k]Limb {
     var buf: [8 * k]u8 = @splat(0);
     @memcpy(buf[8 * k - len ..], be[start..]);
     var r: [k]Limb = undefined;
-    inline for (0..k) |i| r[i] = std.mem.readInt(Limb, buf[8 * k - 8 * (i + 1) ..][0..8], .big);
+    for (0..k) |i| r[i] = std.mem.readInt(Limb, buf[8 * k - 8 * (i + 1) ..][0..8], .big);
     return r;
 }
 
 /// `x` big-endian, right-aligned in `out`, which must have room for it.
 fn limbsToBytes(comptime k: usize, x: [k]Limb, out: []u8) void {
     var buf: [8 * k]u8 = undefined;
-    inline for (0..k) |i| std.mem.writeInt(Limb, buf[8 * k - 8 * (i + 1) ..][0..8], x[i], .big);
+    for (0..k) |i| std.mem.writeInt(Limb, buf[8 * k - 8 * (i + 1) ..][0..8], x[i], .big);
     if (out.len >= buf.len) {
         @memset(out[0 .. out.len - buf.len], 0);
         @memcpy(out[out.len - buf.len ..], &buf);
     } else {
         @memcpy(out, buf[buf.len - out.len ..]);
     }
+}
+
+/// `t + x * y + c`, low limb into `t` and high limb into `c`.
+inline fn mulAdd(t: *Limb, x: Limb, y: Limb, c: *Limb) void {
+    const p = @as(DLimb, x) * y + t.* + c.*;
+    t.* = @truncate(p);
+    c.* = @truncate(p >> 64);
 }
 
 /// All ones when `a == b`, zero otherwise, without a branch.
