@@ -1,6 +1,7 @@
 //! RFC8017: Public Key Cryptography Standards #1 v2.2 (PKCS1)
 const std = @import("std");
 const der = @import("der.zig");
+const mont = @import("mont.zig");
 const ff = std.crypto.ff;
 
 pub const max_modulus_bits = 4096;
@@ -179,6 +180,34 @@ pub const Crt = struct {
     dq: [max_prime_len]u8,
     /// `qInv = q^-1 mod p`.
     q_inv: PrimeModulus.Fe,
+    /// The same key for `mont`, which does the work in a fraction of the
+    /// time `ff` takes. Its sizes cover the primes of every key from 1024 to
+    /// 4096 bits; any other key stays with `ff`.
+    fast: Fast = .none,
+
+    const Fast = union(enum) {
+        none,
+        @"8": mont.Crt(8),
+        @"16": mont.Crt(16),
+        @"24": mont.Crt(24),
+        @"32": mont.Crt(32),
+
+        fn init(p: []const u8, q: []const u8, q_inv: []const u8) Fast {
+            const len = @max(significantLen(p), significantLen(q));
+            inline for (.{ 8, 16, 24, 32 }) |n| {
+                if (len <= n * 8) {
+                    const crt = mont.Crt(n).init(p, q, q_inv) catch return .none;
+                    return @unionInit(Fast, std.fmt.comptimePrint("{d}", .{n}), crt);
+                }
+            }
+            return .none;
+        }
+
+        fn significantLen(x: []const u8) usize {
+            const start = std.mem.indexOfNone(u8, x, &.{0}) orelse x.len;
+            return x.len - start;
+        }
+    };
 
     /// The CRT form of the key with modulus `n`, from the big-endian integers
     /// of a PKCS #1 `RSAPrivateKey`. Null when they do not describe that key,
@@ -215,7 +244,7 @@ pub const Crt = struct {
 
         // dP and dQ are not checked here: a wrong one gives a wrong
         // signature, which `KeyPair.powSecret` catches on every use.
-        var crt: Crt = .{ .p = mp, .q = mq, .dp = undefined, .dq = undefined, .q_inv = qi };
+        var crt: Crt = .{ .p = mp, .q = mq, .dp = undefined, .dq = undefined, .q_inv = qi, .fast = .init(p, q, q_inv) };
         try rightAlign(&crt.dp, dp, byteLen(mp.bits()));
         try rightAlign(&crt.dq, dq, byteLen(mq.bits()));
         return crt;
@@ -249,8 +278,21 @@ pub const Crt = struct {
         // The exponents are passed at the length of their prime, which is
         // public, rather than at the capacity of the largest key: `pow` works
         // through every byte it is given, leading zeros included.
-        const m1 = try p.powWithEncodedExponent(p.reduce(x.v), crt.dp[max_prime_len - byteLen(p.bits()) ..], .big);
-        const m2 = try q.powWithEncodedExponent(q.reduce(x.v), crt.dq[max_prime_len - byteLen(q.bits()) ..], .big);
+        const dp = crt.dp[max_prime_len - byteLen(p.bits()) ..];
+        const dq = crt.dq[max_prime_len - byteLen(q.bits()) ..];
+        switch (crt.fast) {
+            .none => {},
+            inline else => |*f| {
+                var buf: [max_modulus_len]u8 = undefined;
+                const len = byteLen(n.bits());
+                try x.toBytes(buf[0..len], .big);
+                try f.pow(buf[0..len], dp, dq, buf[0..len]);
+                return Fe.fromBytes(n, buf[0..len], .big);
+            },
+        }
+
+        const m1 = try p.powWithEncodedExponent(p.reduce(x.v), dp, .big);
+        const m2 = try q.powWithEncodedExponent(q.reduce(x.v), dq, .big);
 
         // h = qInv * (m1 - m2) (mod p)
         const h = p.mul(p.sub(m1, p.reduce(wide(m2.v))), crt.q_inv);
@@ -1056,6 +1098,42 @@ test "rsa CRT signature matches the one made with d alone" {
     try sig_crt.verify(msg, kp.public);
 }
 
+test "rsa CRT by way of mont agrees with ff, at every size" {
+    if (skip_slow_tests) return error.SkipZigTest;
+    const keys = .{
+        .{ @embedFile("testdata/rsa_1024.der"), .@"8" },
+        .{ @embedFile("testdata/rsa_2050.der"), .@"24" },
+        .{ @embedFile("testdata/rsa_3072.der"), .@"24" },
+        .{ @embedFile("testdata/rsa_4096.der"), .@"32" },
+    };
+    inline for (keys) |key| {
+        const kp = try KeyPair.fromDer(key[0]);
+        const crt = kp.secret.crt.?;
+        try std.testing.expectEqual(key[1], std.meta.activeTag(crt.fast));
+
+        // `ff`'s own CRT path is the reference: it agrees with d, as the
+        // test above checks, and is much quicker than d in a debug build.
+        var by_ff = crt;
+        by_ff.fast = .none;
+
+        const n = kp.public.modulus;
+        var buf: [max_modulus_len]u8 = undefined;
+        const len = byteLen(n.bits());
+        // n - 1, the largest input.
+        try n.v.toBytes(buf[0..len], .big);
+        buf[len - 1] -= 1;
+        const inputs = [_]Fe{
+            try Fe.fromPrimitive(u64, n, 0),
+            try Fe.fromPrimitive(u64, n, 1),
+            try Fe.fromPrimitive(u64, n, 0x0123_4567_89ab_cdef),
+            try Fe.fromBytes(n, buf[0..len], .big),
+        };
+        for (inputs) |x| {
+            try std.testing.expect((try crt.pow(n, x)).eql(try by_ff.pow(n, x)));
+        }
+    }
+}
+
 test "rsa CRT with a wrong exponent still signs correctly, by way of d" {
     if (skip_slow_tests) return error.SkipZigTest;
     var kp = try testKeypair();
@@ -1093,4 +1171,8 @@ test "rsa CRT values that do not describe the key are refused" {
     // nor with a coefficient that is not q's inverse mod p.
     qi[qi.len - 1] ^= 1;
     try std.testing.expect(Crt.init(kp.public.modulus, p, q, dp, dq, qi) == null);
+}
+
+test {
+    _ = mont;
 }
