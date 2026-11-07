@@ -6,6 +6,24 @@ on:
   pull_request:
 
 jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        zig: [0.16.0, 0.17.0]
+        crypto: [std, aws_lc]
+    runs-on: ${{ matrix.os }}
+    name: Unit tests (${{ matrix.os }}, zig ${{ matrix.zig }}, ${{ matrix.crypto }})
+    steps:
+      # Test data is embedded byte for byte; CRLF checkouts would change it.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ matrix.zig }}
+      - run: zig build test -Dcrypto=${{ matrix.crypto }} --summary all
+
   test:
     runs-on: ubuntu-latest
     name: Build and Test

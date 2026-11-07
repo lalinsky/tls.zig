@@ -51,6 +51,15 @@ pub fn build(b: *std.Build) void {
             mod.addCMacro(d, "1");
         }
     }
+    if (t.os.tag == .windows) {
+        // As upstream's CMakeLists.txt; WIN32_LEAN_AND_MEAN also keeps
+        // wincrypt.h's X509_NAME macro out of the X.509 code. Windows has
+        // no assembly here: upstream's is NASM, which Zig cannot assemble.
+        mod.addCMacro("WIN32_LEAN_AND_MEAN", "1");
+        mod.addCMacro("NOMINMAX", "1");
+        mod.addCMacro("_CRT_SECURE_NO_WARNINGS", "1");
+        mod.linkSystemLibrary("ws2_32", .{});
+    }
     // Upstream sets this on the FIPS module and the assembly only; it just
     // keeps s2n-bignum's symbols hidden, which is right for everything.
     mod.addCMacro("S2N_BN_HIDE_SYMBOLS", "1");
