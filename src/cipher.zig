@@ -10,20 +10,33 @@ const record = @import("record.zig");
 const Record = record.Record;
 const Transcript = @import("transcript.zig").Transcript;
 const proto = @import("protocol.zig");
+const build_options = @import("build_options");
+
+/// AES-GCM and ChaCha20-Poly1305 from AWS-LC when built with
+/// `-Dcrypto=aws_lc`, std.crypto otherwise. AEGIS and the CBC suites always
+/// use std.crypto.
+const aead = switch (build_options.crypto) {
+    .std => struct {
+        const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
+        const Aes256Gcm = crypto.aead.aes_gcm.Aes256Gcm;
+        const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
+    },
+    .aws_lc => @import("aws_lc.zig"),
+};
 
 // tls 1.2 cbc cipher types
 const CbcAes128Sha1 = CbcType(crypto.core.aes.Aes128, Sha1);
 const CbcAes128Sha256 = CbcType(crypto.core.aes.Aes128, Sha256);
 const CbcAes256Sha384 = CbcType(crypto.core.aes.Aes256, Sha384);
 // tls 1.2 gcm cipher types
-const Aead12Aes128Gcm = Aead12Type(crypto.aead.aes_gcm.Aes128Gcm);
-const Aead12Aes256Gcm = Aead12Type(crypto.aead.aes_gcm.Aes256Gcm);
+const Aead12Aes128Gcm = Aead12Type(aead.Aes128Gcm);
+const Aead12Aes256Gcm = Aead12Type(aead.Aes256Gcm);
 // tls 1.2 chacha cipher type
-const Aead12ChaCha = Aead12ChaChaType(crypto.aead.chacha_poly.ChaCha20Poly1305);
+const Aead12ChaCha = Aead12ChaChaType(aead.ChaCha20Poly1305);
 // tls 1.3 cipher types
-const Aes128GcmSha256 = Aead13Type(crypto.aead.aes_gcm.Aes128Gcm, Sha256);
-const Aes256GcmSha384 = Aead13Type(crypto.aead.aes_gcm.Aes256Gcm, Sha384);
-const ChaChaSha256 = Aead13Type(crypto.aead.chacha_poly.ChaCha20Poly1305, Sha256);
+const Aes128GcmSha256 = Aead13Type(aead.Aes128Gcm, Sha256);
+const Aes256GcmSha384 = Aead13Type(aead.Aes256Gcm, Sha384);
+const ChaChaSha256 = Aead13Type(aead.ChaCha20Poly1305, Sha256);
 const Aegis128Sha256 = Aead13Type(crypto.aead.aegis.Aegis128L, Sha256);
 
 pub const encrypt_overhead_tls_12: comptime_int = @max(
