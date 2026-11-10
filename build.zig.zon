@@ -1,7 +1,12 @@
 .{
     .name = .tls,
     .version = "0.1.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .aws_lc = .{
+            .path = "aws-lc",
+            .lazy = true,
+        },
+    },
     .fingerprint = 0xacfd1db3d29e1d11,
     .minimum_zig_version = "0.16.0",
     .paths = .{
@@ -9,5 +14,6 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "aws-lc",
     },
 }

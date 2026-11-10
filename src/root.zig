@@ -364,3 +364,7 @@ test {
     _ = @import("transcript.zig");
     _ = @import("PrivateKey.zig");
 }
+
+comptime {
+    if (@import("build_options").crypto == .aws_lc) _ = @import("aws_lc.zig");
+}

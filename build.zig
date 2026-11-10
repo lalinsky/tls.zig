@@ -4,9 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const crypto_backend = b.option(
+        CryptoBackend,
+        "crypto",
+        "Where AES-GCM and ChaCha20-Poly1305 come from (default: std)",
+    ) orelse .std;
+    const build_options = b.addOptions();
+    build_options.addOption(CryptoBackend, "crypto", crypto_backend);
+
     const tls_module = b.addModule("tls", .{
         .root_source_file = b.path("src/root.zig"),
     });
+    setupCrypto(b, tls_module, build_options, crypto_backend, target, optimize);
 
     const examples = [_][]const u8{
         "top_sites",
@@ -19,6 +28,7 @@ pub fn build(b: *std.Build) void {
         "http_get_nonblock",
         "http_get_resumption",
         "http_get2",
+        "bench_transfer",
 
         // "http_get_std",
         // "std_top_sites",
@@ -48,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    setupCrypto(b, lib_mod, build_options, crypto_backend, target, optimize);
     const unit_tests = b.addTest(.{
         .root_module = lib_mod,
     });
@@ -67,6 +78,30 @@ pub fn build(b: *std.Build) void {
     const run_integration_tests = b.addRunArtifact(integration_tests);
     const integration_test_step = b.step("integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
+}
+
+const CryptoBackend = enum { std, aws_lc };
+
+fn setupCrypto(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    build_options: *std.Build.Step.Options,
+    backend: CryptoBackend,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    mod.addOptions("build_options", build_options);
+    switch (backend) {
+        .std => {},
+        .aws_lc => if (b.lazyDependency("aws_lc", .{
+            .target = target,
+            // libcrypto is mostly assembly and constant-time C; a debug build
+            // of it only makes the handshake slow.
+            .optimize = if (optimize == std.builtin.OptimizeMode.Debug) std.builtin.OptimizeMode.ReleaseSafe else optimize,
+        })) |dep| {
+            mod.linkLibrary(dep.artifact("crypto"));
+        },
+    }
 }
 
 // Copied from: https://github.com/karlseguin/mqttz/blob/master/build.zig
