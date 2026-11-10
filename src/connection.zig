@@ -744,7 +744,7 @@ pub const Connection = struct {
             return w.consume(n);
         }
 
-        /// Writing into the window `inPlaceWriter` hands out.
+        /// Writing into the window `writerInPlace` hands out.
         fn initInPlace(c: *Connection) Writer {
             return .{
                 .conn = c,
@@ -822,7 +822,7 @@ pub const Connection = struct {
     /// room for a whole record after every flush, as a socket's writer does;
     /// one that makes room by growing is not supported. The writer's buffer
     /// moves with each record and must not be replaced. One per connection.
-    pub fn inPlaceWriter(c: *Self) Writer {
+    pub fn writerInPlace(c: *Self) Writer {
         assert(c.output.buffer.len > c.cipher.encryptOverhead() + c.cipher.recordLen(key_update_msg.len));
         return .initInPlace(c);
     }
@@ -1066,7 +1066,7 @@ const TestSink = struct {
 /// update falling due while bytes are buffered and a rebase that keeps
 /// some of them.
 fn writeInPlace(client: *Connection, expected: *Io.Writer) !void {
-    var writer = client.inPlaceWriter();
+    var writer = client.writerInPlace();
     const w = &writer.interface;
     var big: [16000]u8 = undefined;
     for (&big, 0..) |*b, i| b.* = @truncate(i *% 31);
