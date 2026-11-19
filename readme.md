@@ -1,6 +1,9 @@
 # tls.zig
 
 > [!NOTE]
+>
+> WILL NO LONGER RECEIVE UPDATES, I'M MIGRATING MY PROJECTS TO https://github.com/lalinsky/ztls
+>
 > This is a fork of [ianic/tls.zig](https://github.com/ianic/tls.zig), maintained for
 > [dusty](https://github.com/lalinsky/dusty). It builds with both Zig 0.16 and 0.17, while
 > upstream `main` requires 0.17.
